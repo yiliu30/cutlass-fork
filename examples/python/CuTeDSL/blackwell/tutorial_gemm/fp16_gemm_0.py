@@ -274,28 +274,28 @@ def kernel(
 def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
     # Construct tiled MMA
     op = tcgen05.MmaF16BF16Op(
-        io_dtype,
-        acc_dtype,
-        mma_inst_shape_mnk,
-        tcgen05.CtaGroup.ONE,
-        tcgen05.OperandSource.SMEM,
-        tcgen05.OperandMajorMode.K,
-        tcgen05.OperandMajorMode.K,
+        ab_dtype=io_dtype,
+        acc_dtype=acc_dtype,
+        instruction_shape=mma_inst_shape_mnk,
+        cta_group=tcgen05.CtaGroup.ONE,
+        a_src=tcgen05.OperandSource.SMEM,
+        a_major_mode=tcgen05.OperandMajorMode.K,
+        b_major_mode=tcgen05.OperandMajorMode.K,
     )
     tiled_mma = cute.make_tiled_mma(op)
 
     # Construct SMEM layouts for A and B
     a_smem_layout = sm100_utils.make_smem_layout_a(
-        tiled_mma,
-        mma_tiler_mnk,
-        a.element_type,
-        ab_stages,
+        tiled_mma=tiled_mma,
+        mma_tiler_mnk=mma_tiler_mnk,
+        a_dtype=a.element_type,
+        num_stages=ab_stages,
     )
     b_smem_layout = sm100_utils.make_smem_layout_b(
-        tiled_mma,
-        mma_tiler_mnk,
-        b.element_type,
-        ab_stages,
+        tiled_mma=tiled_mma,
+        mma_tiler_mnk=mma_tiler_mnk,
+        b_dtype=b.element_type,
+        num_stages=ab_stages,
     )
     a_smem_layout_one_stage = cute.select(a_smem_layout, mode=[0, 1, 2])
     b_smem_layout_one_stage = cute.select(b_smem_layout, mode=[0, 1, 2])
@@ -303,29 +303,29 @@ def host_function(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
     # Construct TMA load atoms
     op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
     a_tma_atom, a_tma_tensor = cute.nvgpu.make_tiled_tma_atom_A(
-        op,
-        a,
-        a_smem_layout_one_stage,
-        mma_tiler_mnk,
-        tiled_mma,
+        op=op,
+        gmem_tensor=a,
+        smem_layout=a_smem_layout_one_stage,
+        mma_tiler_mnk=mma_tiler_mnk,
+        tiled_mma=tiled_mma,
     )
     b_tma_atom, b_tma_tensor = cute.nvgpu.make_tiled_tma_atom_B(
-        op,
-        b,
-        b_smem_layout_one_stage,
-        mma_tiler_mnk,
-        tiled_mma,
+        op=op,
+        gmem_tensor=b,
+        smem_layout=b_smem_layout_one_stage,
+        mma_tiler_mnk=mma_tiler_mnk,
+        tiled_mma=tiled_mma,
     )
 
     # Pretty prints kernel attributes useful for debugging
-    # print(f"a            = {cute.pretty_str(a)}")
-    # print(f"b            = {cute.pretty_str(b)}")
-    # print(f"c            = {cute.pretty_str(c)}")
-    # print(f"tiled_mma    = {cute.pretty_str(tiled_mma)}")
-    # print(f"a_tma_atom   = {cute.pretty_str(a_tma_atom)}")
-    # print(f"b_tma_atom   = {cute.pretty_str(b_tma_atom)}")
-    # print(f"a_tma_tensor = {cute.pretty_str(a_tma_tensor)}")
-    # print(f"b_tma_tensor = {cute.pretty_str(b_tma_tensor)}")
+    print(f"a            = {cute.pretty_str(a)}")
+    print(f"b            = {cute.pretty_str(b)}")
+    print(f"c            = {cute.pretty_str(c)}")
+    print(f"tiled_mma    = {cute.pretty_str(tiled_mma)}")
+    print(f"a_tma_atom   = {cute.pretty_str(a_tma_atom)}")
+    print(f"b_tma_atom   = {cute.pretty_str(b_tma_atom)}")
+    print(f"a_tma_tensor = {cute.pretty_str(a_tma_tensor)}")
+    print(f"b_tma_tensor = {cute.pretty_str(b_tma_tensor)}")
 
     # Launch the kernel
     grid_shape = cute.ceil_div((*c.layout.shape, 1), mma_tiler_mnk[:2])

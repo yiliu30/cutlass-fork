@@ -152,3 +152,11 @@ The parent directory (`../`) contains study guides that walk through the SA3 Bla
 - TMA loads with 3-stage async pipeline
 - Warp specialization (1 producer + 1 consumer warpgroup)
 - Fused online softmax with FP4 quantization in the mainloop
+
+
+### Dev env info
+python: /home/yiliu7/workspace/envs/sage-local/bin/python
+
+### Fcous
+The project is forked from the cutlass for study purpose, the user do not have much background 
+in cutlass/cute, but know the basic of cuda/ptx programming. Please Take this in mind ALWAYS!

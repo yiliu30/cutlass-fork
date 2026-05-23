@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Steps 2–5: CuTe DSL vs Pure CUDA Comparison</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:'JetBrains Mono','Fira Code',monospace;background:#1a1a2e;color:#e0e0e0;padding:20px;line-height:1.5}
+h1{color:#4fc3f7;margin-bottom:5px;font-size:1.4em}
+h2{color:#ff9800;margin:30px 0 12px;font-size:1.15em;border-bottom:1px solid #333;padding-bottom:5px}
+h3{color:#81c784;margin:20px 0 8px;font-size:1em}
+.subtitle{color:#888;font-size:0.82em;margin-bottom:25px}
+.compare{display:grid;grid-template-columns:1fr 1fr;gap:2px;margin:12px 0;border-radius:6px;overflow:hidden}
+.col-header{background:#2a2a4a;padding:6px 10px;font-weight:bold;font-size:0.75em;text-transform:uppercase}
+.col-header.cute{color:#4fc3f7}.col-header.cuda{color:#ff9800}
+.code{background:#0d1117;padding:10px 12px;font-size:0.72em;white-space:pre;overflow-x:auto;border-left:3px solid transparent}
+.code.cute{border-left-color:#4fc3f7}.code.cuda{border-left-color:#ff9800}
+.anno{display:block;margin:8px 0;padding:8px 12px;background:#1e293b;border-radius:5px;font-size:0.8em;border-left:3px solid #66bb6a}
+.tag{display:inline-block;padding:1px 5px;border-radius:3px;font-size:0.7em;margin-right:5px;font-weight:bold}
+.tag-view{background:#263238;color:#80cbc4}
+.tag-load{background:#1b2838;color:#ef5350}
+.tag-compute{background:#1b2838;color:#ffd54f}
+.tag-store{background:#1b2838;color:#ce93d8}
+.insight{background:#1a237e;border:1px solid #3f51b5;border-radius:6px;padding:12px;margin:12px 0;font-size:0.82em}
+.insight strong{color:#7986cb}
+.key{background:#311b00;border:1px solid #e65100;border-radius:5px;padding:8px 12px;margin:8px 0;font-size:0.8em}
+.key::before{content:"💡 "}
+nav{background:#0d1117;padding:10px 15px;border-radius:6px;margin-bottom:20px}
+nav a{color:#4fc3f7;margin-right:15px;text-decoration:none;font-size:0.85em}
+nav a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+
+<h1>Steps 2–5: CuTe DSL Explained via CUDA Equivalents</h1>
+<p class="subtitle">Each step introduces one optimization. Here's how CuTe abstracts what you'd write by hand in CUDA.</p>
+
+<nav>
+<a href="#step2">Step 2: Shared Memory</a>
+<a href="#step3">Step 3: Async Pipeline</a>
+<a href="#step4">Step 4: Tensor Cores</a>
+<a href="#step5">Step 5: Vectorized + SMEM Epilogue</a>
+</nav>
+
+<!-- ================================================================ -->
+<h2 id="step2">Step 2: Shared Memory Tiling</h2>
+<p class="subtitle">Data path: GMEM → SMEM (cooperative) → sync → RMEM → FMA → GMEM</p>
+
+<h3>New CuTe concepts → CUDA equivalents</h3>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute">smem = SmemAllocator()
+sA = smem.allocate_tensor(dtype, sA_layout, align)
+sB = smem.allocate_tensor(dtype, sB_layout, align)</div>
+<div class="code cuda">__shared__ float sA[128 * 8];  // (BM, BK) flattened
+__shared__ float sB[128 * 8];  // (BN, BK) flattened</div>
+</div>
+<div class="anno"><span class="tag tag-view">VIEW</span> <code>SmemAllocator</code> = <code>__shared__</code> declaration. CuTe adds layout metadata; CUDA just gets raw bytes.</div>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute">thr_copy = tiled_copy.get_slice(tidx)
+tAgA = thr_copy.partition_S(gA)  # source (gmem)
+tAsA = thr_copy.partition_D(sA)  # dest (smem)
+cute.copy(tiled_copy, tAgA, tAsA)</div>
+<div class="code cuda">// Thread layout (32, 8): 32 in M, 8 in K
+int copy_m = (tidx % 32) * 4;  // 4 consecutive M-rows
+int copy_k = tidx / 32;         // 1 K-column
+for (int i = 0; i < 4; i++)
+  sA[(copy_m+i) + copy_k*BM] = A_cta[(copy_m+i) + k*M];</div>
+</div>
+<div class="anno"><span class="tag tag-load">LOAD</span> <code>make_tiled_copy_tv</code> + <code>partition_S/D</code> encodes the cooperative thread→element mapping. In CUDA, you manually compute which elements each thread loads. CuTe derives it from the thread layout.</div>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute">cute.arch.sync_threads()</div>
+<div class="code cuda">__syncthreads();</div>
+</div>
+
+<div class="key">Step 2's main win: each A[m,k] loaded from GMEM once, shared by 16 threads with same M-row. Bandwidth reduced ~16× for A (and ~16× for B), at cost of __syncthreads barriers.</div>
+
+<!-- ================================================================ -->
+<h2 id="step3">Step 3: Multi-Stage Async Pipeline</h2>
+<p class="subtitle">Data path: GMEM →(cp.async)→ SMEM[stage] → sync → RMEM → FMA → GMEM</p>
+
+<h3>New CuTe concepts → CUDA equivalents</h3>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># Copy atom with cp.async hardware DMA
+atom = make_copy_atom(CopyG2SOp(), dtype,
+                      num_bits_per_copy=32)
+# Issues cp.async — thread doesn't stall!
+cute.copy(tiled_copy, tAgA[..., k_tile], tAsA[..., stage])
+cute.arch.cp_async_commit_group()
+cute.arch.cp_async_wait_group(NUM_STAGES - 2)</div>
+<div class="code cuda">// cp.async PTX inline — bypasses thread data path
+asm("cp.async.ca.shared.global [%0], [%1], 4;"
+    :: "r"(smem_addr), "l"(gmem_ptr));
+asm("cp.async.commit_group;");
+asm("cp.async.wait_group 1;");  // wait until ≤1 group inflight</div>
+</div>
+<div class="anno"><span class="tag tag-load">LOAD</span> <code>CopyG2SOp</code> = cp.async instruction. The GPU's DMA engine copies data without occupying thread execution slots. Thread can compute on old data while new data arrives.</div>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># SMEM has extra dimension for stages
+sA_layout = tile_to_shape(atom, (BM, BK, NUM_STAGES))
+# Index with stage:
+tAsA[None, None, None, stage]  # select stage</div>
+<div class="code cuda">__shared__ float sA[NUM_STAGES][BM * BK];
+// Index: sA[stage][m + k*BM]
+// Circular: read_stage, write_stage advance modulo NUM_STAGES</div>
+</div>
+
+<div class="key">Pipeline overlaps: while computing on stage[read], DMA fills stage[write]. With 3 stages and NUM_STAGES-2 wait, at most 1 group finishes before compute starts → full overlap of copy+compute after warmup.</div>
+
+<div class="insight">
+<strong>What CuTe hides:</strong> The circular buffer pointer management (<code>read_stage = (read_stage+1) % 3</code>) and commit/wait bookkeeping. In CuTe, the copy just targets the right partition and the framework tracks pipeline state. In CUDA, you manage the state machine manually.
+</div>
+
+<!-- ================================================================ -->
+<h2 id="step4">Step 4: Tensor Cores + Swizzled SMEM</h2>
+<p class="subtitle">Data path: GMEM →(cp.async)→ SMEM[swizzled] →(ldmatrix)→ RMEM → HMMA → GMEM</p>
+
+<h3>New CuTe concepts → CUDA equivalents</h3>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># MMA atom: hardware tensor core instruction
+op = MmaF16BF16Op(FP16, FP32, (16, 8, 16))
+tC = make_layout((2, 2, 1))  # atom_layout: 4 warps
+tiled_mma = make_tiled_mma(op, tC,
+  permutation_mnk=(32, 32, 16))
+
+# Partition from SMEM (not GMEM like step1-3)
+tCsA = thr_mma.partition_A(sA)
+tCsB = thr_mma.partition_B(sB)</div>
+<div class="code cuda">// wmma (or raw mma.sync.m16n8k16 PTX)
+// 4 warps in (2,2) layout: warp_m = warp_id/2
+// Each warp computes 64×64 of the 128×128 tile
+// = 4×4 wmma tiles (each 16×16)
+
+wmma::fragment&lt;matrix_a, 16,16,16, half, col_major&gt; fa;
+wmma::load_matrix_sync(fa, &sA[offset], BM);
+wmma::mma_sync(acc, fa, fb, acc);</div>
+</div>
+<div class="anno"><span class="tag tag-compute">COMPUTE</span> <code>MmaF16BF16Op</code> wraps the hardware's <code>mma.sync.m16n8k16</code>. CuTe's atom_layout (2,2,1) + permutation (32,32,16) tiles this across all 128 threads. In CUDA: you manually assign warp→tile mapping. The fragment load pattern (which SMEM address each lane reads) is what <code>ldmatrix</code> + CuTe's TV layout encode automatically.</div>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># Swizzled SMEM layout — bank-conflict-free
+sA_layout = make_composed_layout(
+  make_swizzle(3, 3, 3),  # 3-bit XOR
+  0,                        # applied to mode 0
+  layout_atom(64, 8):(1, 64))
+
+# G2S copy writes to swizzled addresses
+cute.copy(tiled_copy, gA_partition, sA_partition)</div>
+<div class="code cuda">// Swizzle: XOR-based address transform
+// Within each 64×8 atom: k_swizzled = k ^ ((m>>3) & 7)
+// This spreads bank accesses across 32 banks
+
+int smem_idx(int m, int k, int stage) {
+  int ml = m % 64, kl = k % 8;
+  int ks = kl ^ ((ml >> 3) & 7);  // THE SWIZZLE
+  return ... + ml + ks * 64;
+}</div>
+</div>
+<div class="anno"><span class="tag tag-view">VIEW</span> <code>make_composed_layout</code> wraps a regular layout with a swizzle function. CuTe applies it transparently to all reads/writes. In CUDA, you XOR address bits manually in every indexing expression.</div>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># S2R via ldmatrix (warp-level cooperative load)
+atom_s2r = make_copy_atom(LdMatrix8x8x16bOp(True, 4), dtype)
+tiled_copy_s2r = make_tiled_copy_A(atom_s2r, tiled_mma)
+# Retile register to match ldmatrix output layout
+tCrA_copy = thr_s2r.retile(tCrA)
+cute.copy(tiled_copy_s2r, tCsA_copy, tCrA_copy)</div>
+<div class="code cuda">// In our CUDA version: de-swizzle into linear buffer,
+// then wmma::load_matrix_sync (which internally uses ldmatrix)
+for (int i = lane; i &lt; 256; i += 32)
+  tempA[i] = sA[smem_idx(row, col, stage)];
+__syncwarp();
+wmma::load_matrix_sync(frag_a, tempA, ldm);</div>
+</div>
+<div class="anno"><span class="tag tag-load">LOAD</span> <code>ldmatrix</code> is a warp-cooperative instruction — 32 threads collectively load a matrix fragment from SMEM. CuTe's <code>make_tiled_copy_A(atom, tiled_mma)</code> DERIVES the correct lane→address mapping from the MMA's TV layout. Without CuTe, you'd need to understand the exact PTX fragment layout per thread.</div>
+
+<div class="key">This is CuTe's biggest value proposition: when you change the MMA atom (e.g., m16n8k16 → m16n8k32), the derived S2R copy automatically adjusts. In CUDA, you'd rewrite all the fragment loading logic.</div>
+
+<!-- ================================================================ -->
+<h2 id="step5">Step 5: Vectorized Loads + SMEM Epilogue</h2>
+<p class="subtitle">G2S: 128-bit cp.async (8 FP16/copy). Epilogue: RMEM → SMEM → retile → 128-bit STG</p>
+
+<h3>New CuTe concepts → CUDA equivalents</h3>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># 128-bit cp.async (8 FP16 per transfer)
+atom = make_copy_atom(CopyG2SOp(), dtype,
+                      num_bits_per_copy=128)
+# Thread layout (16, 8) with val_layout (8, 1)
+# → each thread copies 8 consecutive elements per call</div>
+<div class="code cuda">// cp.async.cg 16 bytes — loads 8 FP16 at once
+asm("cp.async.cg.shared.global [%0], [%1], 16;"
+    :: "r"(smem_addr), "l"(gmem_ptr));
+// Thread layout: (16, 8) → 16 groups of 8 M-elements
+// 128 threads × 8 elements = 1024 per round, need 4 rounds</div>
+</div>
+<div class="anno"><span class="tag tag-load">LOAD</span> 128-bit cp.async = 4× fewer instructions than step4's 32-bit version. Requires 16B-aligned source and contiguous elements. CuTe's val_layout (8,1) tells the compiler "8 consecutive elements per copy atom."</div>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code cute"># SMEM Epilogue: retile for coalesced stores
+# 1. Write fragments to SMEM (fragment order)
+autovec_copy(tCrC_fp16, sC_partition)
+sync_threads()
+# 2. Re-read from SMEM in coalesced order
+autovec_copy(sC_retiled, tCrC_retiled)
+# 3. Vectorized 128-bit store to GMEM
+cute.copy(tiled_copy_C, tCrC_retiled, gC_partition)</div>
+<div class="code cuda">// 1. wmma::store to SMEM (row-major)
+wmma::store_matrix_sync(&sC[offset], acc_fp16, BN, row_major);
+__syncthreads();
+
+// 2. Each thread reads 8 consecutive elements from SMEM
+// 3. 128-bit store to GMEM (int4 = 16 bytes = 8 FP16)
+*(int4*)&C[row*N + col] = *(int4*)&sC[flat_idx];</div>
+</div>
+<div class="anno"><span class="tag tag-store">STORE</span> Without SMEM epilogue, tensor core fragments are scattered (the TV layout ≠ coalesced gmem layout). Writing through SMEM lets you "retile" — rearrange from fragment order to coalesced order. Result: 128-bit STG instructions instead of scattered 32-bit stores.</div>
+
+<div class="insight">
+<strong>Why SMEM epilogue matters:</strong><br><br>
+After mma.sync, thread 0 holds C[0,0], C[0,1], C[8,0], C[8,1] — scattered positions.<br>
+For coalesced 128-bit stores, you need 8 consecutive N-elements in one thread.<br><br>
+The retile through SMEM reshuffles: each thread deposits its fragments into SMEM at their logical positions, then re-reads 8 consecutive elements it didn't originally compute. Now stores are perfectly coalesced.<br><br>
+CuTe's <code>make_tiled_copy_C</code> + <code>retile</code> handles this reshuffling automatically based on the output layout.
+</div>
+
+<!-- ================================================================ -->
+<h2>Summary: Progressive Optimization Map</h2>
+<table style="width:100%;border-collapse:collapse;font-size:0.78em;margin-top:10px">
+<tr style="background:#2a2a4a"><th style="padding:6px;text-align:left;color:#4fc3f7">Step</th><th style="color:#ff9800;padding:6px">CUDA technique</th><th style="color:#81c784;padding:6px">CuTe abstraction</th><th style="color:#ce93d8;padding:6px">Speedup source</th></tr>
+<tr><td style="padding:5px;border-bottom:1px solid #333">1→2</td><td style="padding:5px;border-bottom:1px solid #333">__shared__ + cooperative copy + __syncthreads</td><td style="padding:5px;border-bottom:1px solid #333">SmemAllocator + make_tiled_copy_tv</td><td style="padding:5px;border-bottom:1px solid #333">Data reuse (÷16 GMEM reads)</td></tr>
+<tr><td style="padding:5px;border-bottom:1px solid #333">2→3</td><td style="padding:5px;border-bottom:1px solid #333">cp.async + commit/wait + multi-stage buffer</td><td style="padding:5px;border-bottom:1px solid #333">CopyG2SOp + pipeline state (auto)</td><td style="padding:5px;border-bottom:1px solid #333">Overlap copy + compute</td></tr>
+<tr><td style="padding:5px;border-bottom:1px solid #333">3→4</td><td style="padding:5px;border-bottom:1px solid #333">mma.sync + ldmatrix + XOR swizzle</td><td style="padding:5px;border-bottom:1px solid #333">MmaF16BF16Op + make_composed_layout + make_tiled_copy_A</td><td style="padding:5px;border-bottom:1px solid #333">16× compute (TC) + no bank conflicts</td></tr>
+<tr><td style="padding:5px;border-bottom:1px solid #333">4→5</td><td style="padding:5px;border-bottom:1px solid #333">128b cp.async + SMEM retile + 128b STG</td><td style="padding:5px;border-bottom:1px solid #333">num_bits_per_copy=128 + tiled_copy_C + retile</td><td style="padding:5px;border-bottom:1px solid #333">4× fewer copy instr + coalesced stores</td></tr>
+</table>
+
+<div class="insight" style="margin-top:20px">
+<strong>The CuTe promise realized:</strong> From step1 to step5, the kernel body structure stays nearly identical — <code>local_tile → partition → copy → gemm → copy</code>. What changes is the <strong>atoms</strong> and <strong>layouts</strong> passed in from the host. The same <code>cute.copy</code> becomes scalar load (step1), cooperative SMEM load (step2), cp.async (step3), or ldmatrix (step4) — determined entirely by the copy atom. Same <code>cute.gemm</code> becomes scalar FMA (step1) or mma.sync (step4).<br><br>
+In CUDA, each step requires fundamentally rewriting the kernel: new __shared__ declarations, new index math, new PTX inline assembly, new sync patterns. CuTe's layout algebra makes these orthogonal, composable choices.
+</div>
+
+</body>
+</html>

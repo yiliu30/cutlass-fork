@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Step 1: CuTe DSL Explained via CUDA Mapping</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; line-height: 1.5; }
+h1 { color: #4fc3f7; margin-bottom: 10px; font-size: 1.4em; }
+h2 { color: #ff9800; margin: 30px 0 15px; font-size: 1.2em; border-bottom: 1px solid #333; padding-bottom: 5px; }
+.subtitle { color: #888; font-size: 0.85em; margin-bottom: 30px; }
+
+.compare { display: grid; grid-template-columns: 1fr 1fr; gap: 2px; margin: 15px 0; border-radius: 8px; overflow: hidden; }
+.col-header { background: #2a2a4a; padding: 8px 12px; font-weight: bold; font-size: 0.8em; text-transform: uppercase; }
+.col-header.cute { color: #4fc3f7; }
+.col-header.cuda { color: #ff9800; }
+.code-block { background: #0d1117; padding: 12px 14px; font-size: 0.78em; white-space: pre; overflow-x: auto; border-left: 3px solid transparent; }
+.code-block.cute { border-left-color: #4fc3f7; }
+.code-block.cuda { border-left-color: #ff9800; }
+
+.anno { display: block; margin: 8px 0; padding: 8px 12px; background: #1e293b; border-radius: 6px; font-size: 0.82em; border-left: 3px solid #66bb6a; }
+.anno .tag { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 0.75em; margin-right: 6px; font-weight: bold; }
+.tag-view { background: #263238; color: #80cbc4; }
+.tag-load { background: #1b2838; color: #ef5350; }
+.tag-compute { background: #1b2838; color: #ffd54f; }
+.tag-store { background: #1b2838; color: #ce93d8; }
+.tag-alloc { background: #263238; color: #a5d6a7; }
+
+.insight { background: #1a237e; border: 1px solid #3f51b5; border-radius: 8px; padding: 14px; margin: 15px 0; font-size: 0.85em; }
+.insight strong { color: #7986cb; }
+
+.key-point { background: #311b00; border: 1px solid #e65100; border-radius: 6px; padding: 10px 14px; margin: 10px 0; font-size: 0.82em; }
+.key-point::before { content: "💡 "; }
+
+table { width: 100%; border-collapse: collapse; margin: 10px 0; font-size: 0.8em; }
+th { background: #2a2a4a; padding: 6px 10px; text-align: left; color: #4fc3f7; }
+td { padding: 6px 10px; border-bottom: 1px solid #333; }
+td:first-child { color: #4fc3f7; }
+td:nth-child(2) { color: #ff9800; }
+</style>
+</head>
+<body>
+
+<h1>Step 1: Understanding CuTe DSL Through Its CUDA Equivalent</h1>
+<p class="subtitle">You know CUDA. This maps each CuTe abstraction to the CUDA code it replaces — so you see what CuTe "means" operationally.</p>
+
+<!-- ============================================================ -->
+<h2>1. The Big Picture: What CuTe Hides</h2>
+
+<div class="insight">
+In CUDA you manually compute: <strong>"which M,N positions does this thread own?"</strong> and <strong>"what's the global address for position (m,k)?"</strong><br><br>
+In CuTe, both questions are answered by <strong>Layout objects</strong>. The kernel never writes index arithmetic — it calls <code>partition_C/A/B</code> and gets back tensors pointing to exactly its data.<br><br>
+<strong>The generated PTX is the same.</strong> CuTe's value: you can swap the MMA atom (scalar→tensor core) and the partitioning auto-adjusts. In CUDA you'd rewrite all index math.
+</div>
+
+<!-- ============================================================ -->
+<h2>2. Host Setup: What You'd Put Before the <<<>>> Launch</h2>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL (host_gemm)</div>
+<div class="col-header cuda">CUDA equivalent</div>
+<div class="code-block cute">op = cute.nvgpu.MmaUniversalOp(Float32)
+atoms_layout = make_layout((16,16,1), (16,1,0))
+perm_M = make_layout((16,4), (4,1))
+perm_N = make_layout((16,4), (4,1))
+tiled_mma = make_tiled_mma(op, atoms_layout,
+    permutation_mnk=(perm_M, perm_N, None))
+
+grid = ceil_div(mC.shape, (BM, BN))
+block = (256, 1, 1)
+gemm_kernel(..., tiled_mma).launch(grid, block)</div>
+<div class="code-block cuda">// All encoded as compile-time constants:
+#define GROUP_SIZE 4   // ← from R in permutation
+#define GROUP_GAP 64   // ← from F*R / threads_per_dim
+// thr_m = tidx/16, thr_n = tidx%16  ← from atoms_layout
+
+dim3 grid(M/128, N/128, 1);
+dim3 block(256, 1, 1);
+gemm_naive&lt;&lt;&lt;grid, block&gt;&gt;&gt;(A, B, C, M, N, K);</div>
+</div>
+
+<div class="anno"><span class="tag tag-view">KEY</span>
+<code>tiled_mma</code> is a <strong>compile-time descriptor</strong> — it encodes the thread↔element mapping rules. In CUDA, these rules become your hardcoded index formulas (<code>tidx/16</code>, <code>*4</code>, <code>+64</code>). CuTe makes them composable and swappable.</div>
+
+<!-- ============================================================ -->
+<h2>3. local_tile — "Give This CTA Its Slice"</h2>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code-block cute">gA = cute.local_tile(mA,
+    tiler=cta_tiler,      # (128, 128, 8)
+    coord=(bidx, bidy, None),
+    proj=(1, None, 1))    # keep M, drop N, keep K
+<span style="color:#666">
+# Result: Tensor&lt;gmem, (128, 8, 4):(1, M, M*BK)&gt;
+# Still global-memory pointer, just new layout</span></div>
+<div class="code-block cuda">const float* A_cta = A + bidx * BM;
+// Then index as: A_cta[m + k*M]
+// k_tile selection: kt*BK offset in k
+<span style="color:#666">
+// That's it — pointer + manual offset math
+// No "tensor object" in CUDA</span></div>
+</div>
+
+<div class="anno"><span class="tag tag-view">VIEW</span>
+<strong>Zero hardware work.</strong> CuTe returns a new tensor with adjusted pointer + layout that encodes the tiling. In CUDA, you just do <code>A + bidx*BM</code> and remember to multiply <code>k*M</code> later. Same addresses, different bookkeeping.</div>
+
+<div class="key-point">CuTe's <code>local_tile</code> also splits the K dimension into tiles and returns a 3D tensor <code>(BM, BK, num_k_tiles)</code>. In CUDA you'd handle this with the k_tile loop variable. CuTe makes the "K is tiled" fact part of the type.</div>
+
+<!-- ============================================================ -->
+<h2>4. get_slice + partition_C — "Which Output Elements Are Mine?"</h2>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code-block cute">thr_mma = tiled_mma.get_slice(tidx)
+tCgC = thr_mma.partition_C(gC)
+<span style="color:#666">
+# tCgC: Tensor&lt;gmem, (1,(4,2),(4,2)):(0,(128,8192),(1,64))&gt;
+#                      V  M_rest N_rest
+# This IS the ownership pattern — encoded as a Layout</span></div>
+<div class="code-block cuda">int thr_m = tidx / 16;
+int thr_n = tidx % 16;
+int m_pos[8], n_pos[8];
+for (g = 0; g &lt; 2; g++)
+  for (i = 0; i &lt; 4; i++) {
+    m_pos[g*4+i] = thr_m*4 + g*64 + i;
+    n_pos[g*4+i] = thr_n*4 + g*64 + i;
+  }
+<span style="color:#666">
+// You manually decode the pattern
+// CuTe encodes it as the stride tuple</span></div>
+</div>
+
+<div class="anno"><span class="tag tag-view">VIEW</span>
+<strong>No data moved.</strong> <code>partition_C</code> returns a tensor that, when indexed, gives you the global address of your element. The nested shape <code>(4,2)</code> = "4 consecutive, then repeat with gap". In CUDA, you wrote that as the loop structure.</div>
+
+<div class="insight">
+<strong>Why (4,2) instead of flat 8?</strong><br>
+The nested shape preserves the <em>structure</em> of the permutation. The inner 4 = R (consecutive group), outer 2 = repetitions. This matters because:<br>
+• Inner-4 elements have stride 1 (or 128 for M) → vectorizable as LDG.128<br>
+• The gap between groups (64 columns, 8192 bytes for M) is a separate access<br><br>
+CuTe keeps this structure so <code>autovec_copy</code> can emit vector loads for the consecutive parts.
+</div>
+
+<!-- ============================================================ -->
+<h2>5. make_fragment_C + fill — "Allocate My Accumulators"</h2>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code-block cute">tCrC = tiled_mma.make_fragment_C(tCgC)
+tCrC.fill(0.0)
+<span style="color:#666">
+# tCrC: Tensor&lt;rmem, (1,(4,2),(4,2))&gt;
+# Same shape as tCgC but in register file
+# 64 floats = 256 bytes of registers</span></div>
+<div class="code-block cuda">float acc[8][8];
+for (m = 0; m &lt; 8; m++)
+  for (n = 0; n &lt; 8; n++)
+    acc[m][n] = 0.0f;
+<span style="color:#666">
+// 64 floats, same thing
+// Compiler puts in registers</span></div>
+</div>
+
+<div class="anno"><span class="tag tag-alloc">ALLOC</span>
+<strong>Real work: register allocation + zero-init.</strong> <code>make_fragment_C</code> uses <code>tCgC</code> only for its shape — it allocates a register tensor with identical logical structure but different (packed) strides.</div>
+
+<!-- ============================================================ -->
+<h2>6. The K-Loop: partition_A/B + copy + gemm</h2>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code-block cute">for k_tile in range(num_k_tiles):      # 4
+  tCgA = thr_mma.partition_A(gA[:,:,k_tile])
+  tCrA = make_fragment_like(tCgA)
+  <span style="color:#ef5350">cute.autovec_copy(tCgA, tCrA)</span>       # ← LOAD
+
+  tCgB = thr_mma.partition_B(gB[:,:,k_tile])
+  tCrB = make_fragment_like(tCgB)
+  <span style="color:#ef5350">cute.autovec_copy(tCgB, tCrB)</span>       # ← LOAD
+
+  for k_block in range(8):             # BK
+    <span style="color:#ffd54f">cute.gemm(tiled_mma, tCrC,</span>
+      <span style="color:#ffd54f">tCrA[:,:,k_block],</span>
+      <span style="color:#ffd54f">tCrB[:,:,k_block], tCrC)</span>         # ← COMPUTE</div>
+<div class="code-block cuda">for (kt = 0; kt &lt; K/BK; kt++) {       // 4
+  float rA[8][8], rB[8][8];
+
+  for (m = 0; m &lt; 8; m++)
+    for (k = 0; k &lt; 8; k++)
+      <span style="color:#ef5350">rA[m][k] = A_cta[m_pos[m] + (kt*8+k)*M];</span>
+
+  for (n = 0; n &lt; 8; n++)
+    for (k = 0; k &lt; 8; k++)
+      <span style="color:#ef5350">rB[n][k] = B_cta[n_pos[n] + (kt*8+k)*N];</span>
+
+  for (k = 0; k &lt; 8; k++)
+    for (m = 0; m &lt; 8; m++)
+      for (n = 0; n &lt; 8; n++)
+        <span style="color:#ffd54f">acc[m][n] += rA[m][k] * rB[n][k];</span>
+}</div>
+</div>
+
+<div class="anno"><span class="tag tag-load">LOAD</span> <code>autovec_copy</code> = the LDG instructions. This is where bandwidth is consumed.</div>
+<div class="anno"><span class="tag tag-compute">COMPUTE</span> <code>cute.gemm</code> = the FFMA instructions. For scalar atom, it's just the triple-nested multiply-add.</div>
+
+<div class="key-point"><code>partition_A</code> gives shape <code>(1, (4,2), 8)</code> = (V, M_rest, K). The K=8 dimension is the full BK — this thread needs ALL K values for its M-positions. In CUDA that's your inner <code>k</code> loop.</div>
+
+<div class="insight">
+<strong>Why does CuTe separate <code>partition</code> from <code>copy</code>?</strong><br><br>
+In CUDA you fuse "compute address" and "load" into one line: <code>rA[m][k] = A[addr]</code>.<br>
+CuTe splits them:<br>
+1. <code>partition_A</code> → creates a gmem tensor with your addresses (VIEW, free)<br>
+2. <code>autovec_copy</code> → issues the loads (REAL WORK)<br><br>
+This separation lets you later insert shared memory between them (step2) or use async copy (step3) <strong>without changing the partition logic</strong>. The "what's mine" question stays the same; only "where do I read from" changes.
+</div>
+
+<!-- ============================================================ -->
+<h2>7. Epilogue: copy back</h2>
+
+<div class="compare">
+<div class="col-header cute">CuTe DSL</div>
+<div class="col-header cuda">CUDA</div>
+<div class="code-block cute">atom = make_copy_atom(CopyUniversalOp(), f32)
+<span style="color:#ce93d8">cute.copy(atom, tCrC, tCgC)</span>
+<span style="color:#666">
+# tCrC (registers) → tCgC (global memory)
+# Uses the SAME layout/strides from partition_C
+# so each value lands at its correct global position</span></div>
+<div class="code-block cuda">for (m = 0; m &lt; 8; m++) {
+  int gm = bidx*128 + m_pos[m];
+  for (n = 0; n &lt; 8; n++) {
+    int gn = bidy*128 + n_pos[n];
+    <span style="color:#ce93d8">C[gm*N + gn] = acc[m][n];</span>
+  }
+}
+<span style="color:#666">
+// STG instructions, 64 stores</span></div>
+</div>
+
+<div class="anno"><span class="tag tag-store">STORE</span> <code>cute.copy</code> walks both tensors element-by-element: reads <code>tCrC[i]</code> (register), writes to <code>tCgC[i]</code> (global address computed from partition_C's strides). Same as your nested store loops.</div>
+
+<!-- ============================================================ -->
+<h2>8. Summary: What CuTe Abstracts Away</h2>
+
+<table>
+<tr><th>Your CUDA responsibility</th><th>CuTe equivalent</th><th>Why it matters</th></tr>
+<tr><td>Compute thread → (thr_m, thr_n)</td><td>atoms_layout + get_slice</td><td>Change atom count? Layout auto-adjusts</td></tr>
+<tr><td>Compute m_pos[], n_pos[] arrays</td><td>permutation + partition_C</td><td>Change grouping? Just change R</td></tr>
+<tr><td>A_cta pointer + k*M offset</td><td>local_tile + partition_A</td><td>Change tile size or memory layout? Same API</td></tr>
+<tr><td>Manage rA[8][8] declaration</td><td>make_fragment_like</td><td>Shape auto-derived from partition</td></tr>
+<tr><td>LDG loop</td><td>autovec_copy</td><td>Vectorizes when strides allow it</td></tr>
+<tr><td>FMA triple loop</td><td>cute.gemm</td><td>Swap atom to tensor core → same call</td></tr>
+<tr><td>STG loop</td><td>cute.copy</td><td>Same copy API for any epilogue pattern</td></tr>
+</table>
+
+<div class="insight" style="margin-top:20px">
+<strong>The promise of CuTe:</strong> Your CUDA kernel has index math <em>baked</em> for one specific configuration. To switch from scalar FMA to mma.sync.m16n8k16, you'd rewrite every index formula.<br><br>
+In CuTe: change <code>MmaUniversalOp</code> → <code>MmaF16BF16Op</code>, adjust <code>atoms_layout</code> to <code>(2,2,1)</code>, and the <strong>kernel body stays identical</strong>. The partitions, copies, and gemm calls all auto-adapt because they're driven by the TiledMMA's layout algebra, not hardcoded constants.
+</div>
+
+</body>
+</html>

@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CuTe DSL vs Pure CUDA GEMM — Side-by-Side</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 2rem; background: #1a1a2e; color: #e0e0e0; line-height: 1.6; }
+  h1 { color: #76b900; text-align: center; margin-bottom: 0.5rem; }
+  h2 { color: #76b900; border-bottom: 2px solid #333; padding-bottom: 0.3rem; }
+  h3 { color: #00bcd4; margin-top: 1.5rem; }
+  .subtitle { text-align: center; color: #aaa; margin-bottom: 2rem; }
+  .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin: 1.5rem 0; }
+  .panel { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #333; }
+  .panel h3 { margin-top: 0; }
+  .panel.cuda { border-left: 4px solid #f44336; }
+  .panel.cute { border-left: 4px solid #76b900; }
+  pre { background: #0f0f23; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; line-height: 1.4; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  .keyword { color: #c792ea; }
+  .comment { color: #6a737d; }
+  .func { color: #82aaff; }
+  .string { color: #c3e88d; }
+  .number { color: #f78c6c; }
+  .highlight { background: #2a3a5e; padding: 0.1rem 0.3rem; border-radius: 3px; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { padding: 0.7rem; text-align: left; border: 1px solid #333; }
+  th { background: #16213e; color: #76b900; }
+  tr:nth-child(even) { background: #1a1a3e; }
+  .arrow { color: #76b900; font-size: 1.5rem; text-align: center; }
+  .insight { background: #1a3a1a; border: 1px solid #76b900; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .insight::before { content: "💡 "; }
+  .section { margin-bottom: 3rem; }
+  .flow { background: #0f0f23; padding: 1.5rem; border-radius: 8px; font-family: monospace; font-size: 0.9rem; white-space: pre; overflow-x: auto; }
+</style>
+</head>
+<body>
+
+<h1>CuTe DSL vs Pure CUDA GEMM</h1>
+<p class="subtitle">How CuTe abstracts away the manual index math you'd write in raw CUDA</p>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>1. Overall Structure</h2>
+
+<table>
+<tr>
+  <th>Aspect</th>
+  <th>Pure CUDA</th>
+  <th>CuTe DSL</th>
+</tr>
+<tr>
+  <td>Language</td>
+  <td>C++ / CUDA C</td>
+  <td>Python (compiles to PTX via MLIR)</td>
+</tr>
+<tr>
+  <td>Thread↔Data mapping</td>
+  <td>Manual index arithmetic</td>
+  <td>Encoded in TiledMMA layouts — automatic</td>
+</tr>
+<tr>
+  <td>Tiling</td>
+  <td>Manual offset calculation per block</td>
+  <td><code>cute.local_tile(tensor, tiler, coord, proj)</code></td>
+</tr>
+<tr>
+  <td>MMA dispatch</td>
+  <td>Explicit PTX inline asm or wmma API</td>
+  <td>Swap the Atom — everything re-derives</td>
+</tr>
+<tr>
+  <td>Shared memory layout</td>
+  <td>Manual padding / swizzle for bank conflicts</td>
+  <td><code>make_composed_layout(swizzle, ...)</code></td>
+</tr>
+<tr>
+  <td>Changing arch</td>
+  <td>Rewrite kernel from scratch</td>
+  <td>Change atom + copy atoms, rest adapts</td>
+</tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>2. Kernel Code — Side by Side</h2>
+
+<div class="comparison">
+<div class="panel cuda">
+<h3>🔴 Pure CUDA — Naive GEMM</h3>
+<pre><code><span class="comment">// Manual index math everywhere</span>
+<span class="keyword">__global__</span> void gemm_naive(
+    <span class="keyword">float</span> *A, <span class="keyword">float</span> *B, <span class="keyword">float</span> *C,
+    <span class="keyword">int</span> M, <span class="keyword">int</span> N, <span class="keyword">int</span> K)
+{
+  <span class="comment">// Step A: Which tile am I?</span>
+  <span class="keyword">int</span> bx = blockIdx.x;
+  <span class="keyword">int</span> by = blockIdx.y;
+  <span class="keyword">int</span> tx = threadIdx.x;
+
+  <span class="comment">// Step B: Manual thread→element mapping</span>
+  <span class="keyword">int</span> row = bx * BM + (tx / <span class="number">16</span>) * <span class="number">4</span>;
+  <span class="keyword">int</span> col = by * BN + (tx % <span class="number">16</span>) * <span class="number">4</span>;
+
+  <span class="comment">// Step C: K-loop</span>
+  <span class="keyword">float</span> acc[<span class="number">4</span>][<span class="number">4</span>] = {<span class="number">0</span>};
+  <span class="keyword">for</span> (<span class="keyword">int</span> k = <span class="number">0</span>; k &lt; K; k += BK) {
+    <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="number">0</span>; i &lt; <span class="number">4</span>; i++)
+      <span class="keyword">for</span> (<span class="keyword">int</span> j = <span class="number">0</span>; j &lt; <span class="number">4</span>; j++)
+        <span class="keyword">for</span> (<span class="keyword">int</span> kk = <span class="number">0</span>; kk &lt; BK; kk++)
+          <span class="comment">// YOU compute the address</span>
+          acc[i][j] += A[(row+i)*K + k+kk]
+                     * B[(col+j)*K + k+kk];
+  }
+
+  <span class="comment">// Step D: Store — manual global offset</span>
+  <span class="keyword">for</span> (<span class="keyword">int</span> i = <span class="number">0</span>; i &lt; <span class="number">4</span>; i++)
+    <span class="keyword">for</span> (<span class="keyword">int</span> j = <span class="number">0</span>; j &lt; <span class="number">4</span>; j++)
+      C[(row+i)*N + col+j] = acc[i][j];
+}</code></pre>
+</div>
+
+<div class="panel cute">
+<h3>🟢 CuTe DSL — Same GEMM</h3>
+<pre><code><span class="comment"># Layouts encode the mapping</span>
+<span class="keyword">@cute.kernel</span>
+<span class="keyword">def</span> <span class="func">gemm_kernel</span>(mA, mB, mC, tiled_mma):
+    tidx = cute.arch.thread_idx()[<span class="number">0</span>]
+    bidx, bidy = cute.arch.block_idx()[:<span class="number">2</span>]
+
+    <span class="comment"># Step A: CuTe tiles for you</span>
+    gA = cute.local_tile(mA, tiler, (bidx,bidy,None),
+                         proj=(<span class="number">1</span>,None,<span class="number">1</span>))
+    gB = cute.local_tile(mB, tiler, (bidx,bidy,None),
+                         proj=(None,<span class="number">1</span>,<span class="number">1</span>))
+    gC = cute.local_tile(mC, tiler, (bidx,bidy,None),
+                         proj=(<span class="number">1</span>,<span class="number">1</span>,None))
+
+    <span class="comment"># Step B: TiledMMA knows the mapping</span>
+    thr_mma = tiled_mma.get_slice(tidx)
+    tCgC = thr_mma.partition_C(gC)
+    tCrC = tiled_mma.make_fragment_C(tCgC)
+    tCrC.fill(<span class="number">0.0</span>)
+
+    <span class="comment"># Step C: K-loop — no index math</span>
+    <span class="keyword">for</span> k <span class="keyword">in</span> range(num_k_tiles):
+        tCrA = cute.make_fragment_like(...)
+        cute.copy(tCgA, tCrA)
+        <span class="func">cute.gemm</span>(tiled_mma, tCrC, tCrA, tCrB, tCrC)
+
+    <span class="comment"># Step D: Epilogue — copy handles layout</span>
+    cute.copy(atom, tCrC, tCgC)
+</code></pre>
+</div>
+</div>
+
+<div class="insight">
+The CUDA version has index math <strong>scattered everywhere</strong> — and it's wrong the moment you change the data layout, tile size, or MMA instruction. In CuTe, the layout algebra handles all of this. You describe "what" not "how."
+</div>
+</div>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>3. The Key Difference: Who Computes Addresses?</h2>
+
+<div class="flow">
+<strong>Pure CUDA:</strong>
+   Thread 42 wants A[row][k]:
+   → programmer manually computes: ptr + row*K + k
+   → changes layout? rewrite formula
+   → changes arch?   rewrite kernel
+
+<strong>CuTe DSL:</strong>
+   Thread 42 wants its A elements:
+   → TiledMMA layout says: "thread 42 owns these (V,M,K) coords"
+   → partition_A applies layout composition: coords → offset
+   → changes layout? layout algebra adapts
+   → changes arch?   swap the atom, rest re-derives
+</div>
+</div>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>4. TiledMMA Construction — The "Missing Piece" in CUDA</h2>
+
+<p>In pure CUDA, the thread↔data mapping is implicit in your index math. CuTe makes it <strong>explicit and composable</strong>:</p>
+
+<pre><code><span class="comment"># Host side (@cute.jit) — compile-time constant</span>
+tiled_mma = cute.make_tiled_mma(
+    atom,            <span class="comment"># What hardware instruction? (shape + thread↔element contract)</span>
+    atoms_layout,    <span class="comment"># How many, tiled how in (M,N,K)?</span>
+    permutation_mnk  <span class="comment"># Reorder for memory access patterns</span>
+)
+</code></pre>
+
+<table>
+<tr>
+  <th>Component</th>
+  <th>CUDA Equivalent</th>
+  <th>CuTe DSL</th>
+</tr>
+<tr>
+  <td>atom</td>
+  <td>The FMA/HMMA/WMMA you call in inline asm</td>
+  <td><code>MmaUniversalOp(f32)</code> or <code>MmaF16BF16Op(f16,f32,(16,8,16))</code></td>
+</tr>
+<tr>
+  <td>atoms_layout</td>
+  <td>Your mental picture of "256 threads form a 16×16 grid"</td>
+  <td><code>make_layout((16,16,1), stride=(16,1,0))</code></td>
+</tr>
+<tr>
+  <td>permutation</td>
+  <td>That tricky index remapping you hardcode for coalescing</td>
+  <td><code>((16,4):(4,1), (16,4):(4,1), None)</code></td>
+</tr>
+<tr>
+  <td>partition_A/B/C</td>
+  <td><code>row = bx*BM + (tx/16)*4;</code> etc.</td>
+  <td><code>thr_mma.partition_C(gC)</code> — derived from layouts</td>
+</tr>
+</table>
+
+<div class="insight">
+In CUDA, you <strong>are</strong> the layout algebra — you do the math in your head and encode it as index expressions. CuTe makes the algebra explicit so the compiler can derive everything from the atom.
+</div>
+</div>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>5. What Happens When You Scale Up (SMEM + Tensor Cores)</h2>
+
+<div class="comparison">
+<div class="panel cuda">
+<h3>🔴 CUDA: Everything Changes</h3>
+<ul>
+  <li>Add <code>__shared__</code> arrays with manual padding</li>
+  <li>Rewrite all load loops for cp.async</li>
+  <li>Manually compute swizzled SMEM addresses</li>
+  <li>Rewrite compute loop for <code>mma.sync</code> PTX</li>
+  <li>Fragment layout is arch-specific — hardcoded</li>
+  <li>Pipeline stages = copy-paste with index offsets</li>
+</ul>
+<p><strong>Result:</strong> ~500 lines, fragile, arch-locked</p>
+</div>
+
+<div class="panel cute">
+<h3>🟢 CuTe: Swap Components</h3>
+<ul>
+  <li>Add SMEM allocator + composed swizzle layout</li>
+  <li>Swap copy atom: <code>CopyUniversalOp</code> → <code>CopyG2SOp</code></li>
+  <li>Swap MMA atom: <code>MmaUniversalOp</code> → <code>MmaF16BF16Op</code></li>
+  <li>Add S2R copy atom: <code>LdMatrix8x8x16bOp</code></li>
+  <li>Pipeline = extra SMEM dimension + commit/wait</li>
+  <li>Kernel structure (A→B→C→D) unchanged</li>
+</ul>
+<p><strong>Result:</strong> Same structure, new atoms, works</p>
+</div>
+</div>
+</div>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>6. The Progression Summarized</h2>
+
+<div class="flow">
+         Pure CUDA                          CuTe DSL
+         ─────────                          ────────
+Step 1:  Manual index math                  local_tile + partition + gemm
+Step 2:  + manual SMEM + syncthreads        + SmemAllocator + tiled_copy
+Step 3:  + cp.async inline asm              + CopyG2SOp atom + commit/wait
+Step 4:  + mma.sync PTX + swizzle hack      + MmaF16BF16Op + composed_layout
+Step 5:  + vectorized asm + reg staging     + 128b copy atom + retile
+
+Each CUDA step = rewrite.     Each CuTe step = swap a component.
+</div>
+</div>
+
+<!-- ============================================================ -->
+<div class="section">
+<h2>7. Mental Model</h2>
+
+<div class="flow">
+┌─────────────────────────────────────────────────────────────────────┐
+│  CUDA programmer's job:                                             │
+│                                                                     │
+│    "I am the compiler. I manually derive addresses from tile coords,│
+│     thread IDs, warp lanes, and hardware instruction layouts."      │
+│                                                                     │
+│  CuTe programmer's job:                                             │
+│                                                                     │
+│    "I describe the hardware contract (atom) and the tiling strategy │
+│     (atoms_layout). CuTe derives all the address math for me."      │
+│                                                                     │
+│  The atom IS the hardware manual page, encoded as layouts.          │
+│  Everything else is layout composition.                             │
+└─────────────────────────────────────────────────────────────────────┘
+</div>
+</div>
+
+</body>
+</html>

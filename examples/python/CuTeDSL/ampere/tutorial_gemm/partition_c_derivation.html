@@ -1,0 +1,691 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>partition_C: The Problem, The Algebra, The Derivation</title>
+<style>
+  :root {
+    --bg: #0d1117; --fg: #c9d1d9; --accent: #58a6ff; --green: #3fb950;
+    --yellow: #d29922; --red: #f85149; --purple: #bc8cff; --orange: #f0883e;
+    --card: #161b22; --border: #30363d; --dim: #8b949e;
+    --step1: #58a6ff; --step2: #3fb950; --step3: #d29922; --step4: #bc8cff; --step5: #f0883e;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: var(--bg); color: var(--fg); padding: 2rem; line-height: 1.6; }
+  h1 { color: var(--accent); font-size: 1.8rem; margin-bottom: 0.5rem; text-align: center; }
+  h2 { color: var(--green); font-size: 1.3rem; margin: 2rem 0 0.8rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+  h3 { color: var(--yellow); font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }
+  .subtitle { text-align: center; color: var(--dim); margin-bottom: 2rem; font-size: 0.9rem; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 1.2rem; margin: 1rem 0; }
+  .card.problem { border-left: 4px solid var(--red); }
+  .card.principle { border-left: 4px solid var(--purple); }
+  .card.step { border-left: 4px solid var(--accent); }
+  .card.step1 { border-left-color: var(--step1); }
+  .card.step2 { border-left-color: var(--step2); }
+  .card.step3 { border-left-color: var(--step3); }
+  .card.step4 { border-left-color: var(--step4); }
+  .card.step5 { border-left-color: var(--step5); }
+  .code { background: #0d1117; border: 1px solid var(--border); border-radius: 4px; padding: 0.8rem; font-size: 0.85rem; overflow-x: auto; white-space: pre; }
+  .inline-code { background: #21262d; padding: 0.15rem 0.4rem; border-radius: 3px; font-size: 0.85rem; }
+  .highlight { color: var(--accent); font-weight: bold; }
+  .highlight-green { color: var(--green); font-weight: bold; }
+  .highlight-yellow { color: var(--yellow); font-weight: bold; }
+  .highlight-purple { color: var(--purple); font-weight: bold; }
+  .highlight-red { color: var(--red); font-weight: bold; }
+  .highlight-orange { color: var(--orange); font-weight: bold; }
+  .dim { color: var(--dim); }
+  .arrow { color: var(--green); font-size: 1.2rem; }
+  .grid-viz { display: grid; gap: 1px; margin: 0.8rem auto; width: fit-content; }
+  .grid-cell { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; font-size: 0.55rem; border-radius: 2px; }
+  .abbr-table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; font-size: 0.85rem; }
+  .abbr-table th, .abbr-table td { padding: 0.4rem 0.8rem; border: 1px solid var(--border); }
+  .abbr-table th { background: #21262d; color: var(--accent); text-align: left; }
+  .pipeline { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; margin: 1rem 0; justify-content: center; }
+  .pipeline-box { background: var(--card); border: 2px solid; border-radius: 8px; padding: 0.6rem 1rem; text-align: center; font-size: 0.85rem; min-width: 120px; }
+  .pipeline-arrow { color: var(--green); font-size: 1.5rem; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
+  @media (max-width: 800px) { .two-col { grid-template-columns: 1fr; } }
+  .transform-viz { margin: 1rem 0; padding: 1rem; background: #0d1117; border-radius: 8px; border: 1px solid var(--border); }
+  .transform-row { display: flex; align-items: center; gap: 0.5rem; margin: 0.5rem 0; flex-wrap: wrap; }
+  .transform-label { min-width: 90px; color: var(--dim); font-size: 0.8rem; text-align: right; }
+  .transform-content { font-size: 0.85rem; }
+  .section-nav { display: flex; gap: 0.5rem; flex-wrap: wrap; justify-content: center; margin: 1rem 0; }
+  .section-nav a { color: var(--accent); text-decoration: none; background: #21262d; padding: 0.3rem 0.8rem; border-radius: 4px; font-size: 0.8rem; }
+  .section-nav a:hover { background: #30363d; }
+  .formula { text-align: center; font-size: 1.1rem; padding: 0.8rem; margin: 0.8rem 0; background: #21262d; border-radius: 6px; }
+  .thought-bubble { background: #1c2333; border: 1px dashed var(--yellow); border-radius: 8px; padding: 1rem; margin: 0.8rem 0; }
+  .thought-bubble::before { content: "💡 "; }
+  .grid-16x16 { display: grid; grid-template-columns: repeat(16, 18px); gap: 1px; margin: 0.5rem auto; width: fit-content; }
+  .g-cell { width: 18px; height: 18px; display: flex; align-items: center; justify-content: center; font-size: 0.5rem; border-radius: 2px; color: #000; font-weight: bold; }
+  .toc { list-style: none; padding: 0; }
+  .toc li { margin: 0.3rem 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  details { margin: 0.5rem 0; }
+  summary { cursor: pointer; color: var(--accent); font-weight: bold; }
+  summary:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+
+<h1>partition_C: Thread-to-Element Mapping Derivation</h1>
+<p class="subtitle">How CuTe transforms (128, 128):(128, 1) → (1, (4,2), (4,2)):(0, (128,8192), (1,64)) in 5 algebraic steps</p>
+
+<nav class="section-nav">
+  <a href="#problem">The Problem</a>
+  <a href="#glossary">Glossary</a>
+  <a href="#principle">Core Principle</a>
+  <a href="#inputs">Inputs</a>
+  <a href="#pipeline">Pipeline</a>
+  <a href="#step1">Step 1: logical_divide</a>
+  <a href="#step2">Step 2: zipped_divide</a>
+  <a href="#step3">Step 3: compose</a>
+  <a href="#step4">Step 4: zipped_divide</a>
+  <a href="#step5">Step 5: slice</a>
+  <a href="#verify">Verify</a>
+</nav>
+
+<!-- ============================================================ -->
+<h2 id="problem">🔴 The Problem partition_C Solves</h2>
+<!-- ============================================================ -->
+
+<div class="card problem">
+  <p><strong>Given:</strong></p>
+  <ul>
+    <li>A 128×128 output tile <span class="inline-code">gC</span> in global memory (row-major)</li>
+    <li>256 threads that need to collaboratively compute this tile</li>
+    <li>A Multiply-Accumulate (MMA) instruction (here: scalar FMA — Fused Multiply-Add)</li>
+  </ul>
+  <p style="margin-top:0.8rem"><strong>Need:</strong></p>
+  <p>For each thread, produce a <em>view</em> (pointer + layout) into <span class="inline-code">gC</span> that selects <strong>exactly the 64 elements</strong> this thread is responsible for — <em>without moving any data</em>.</p>
+  <p style="margin-top:0.8rem"><strong>Why 64?</strong> 128 × 128 = 16,384 elements ÷ 256 threads = 64 elements per thread.</p>
+</div>
+
+<div class="thought-bubble">
+  In raw CUDA you'd write: <span class="inline-code">int row = threadIdx.x / 16; int col = threadIdx.x % 16;</span> and manually compute which 8×8 sub-tile this thread owns. CuTe replaces all of that with <strong>layout algebra</strong> — composable, type-safe, zero-cost abstractions that work for <em>any</em> MMA instruction, not just scalar FMA.
+</div>
+
+<!-- ============================================================ -->
+<h2 id="glossary">📖 Glossary: Abbreviations → Full Names</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<table class="abbr-table">
+  <tr><th>Abbreviation</th><th>Full Name</th><th>What It Is</th></tr>
+  <tr><td>MMA</td><td>Matrix Multiply-Accumulate</td><td>Hardware instruction: D = A × B + C</td></tr>
+  <tr><td>FMA</td><td>Fused Multiply-Add</td><td>Scalar MMA: d = a × b + c</td></tr>
+  <tr><td>CTA</td><td>Cooperative Thread Array</td><td>= thread block in CUDA</td></tr>
+  <tr><td>TV</td><td>Thread-Value</td><td>Layout mapping (thread_idx, value_idx) → element offset</td></tr>
+  <tr><td>Thr</td><td>Thread</td><td>Thread dimension in a layout</td></tr>
+  <tr><td>Frg / Frag</td><td>Fragment</td><td>Per-thread owned data elements</td></tr>
+  <tr><td>V / Val</td><td>Value</td><td>Elements within one atom execution</td></tr>
+  <tr><td>Perm</td><td>Permutation</td><td>Reordering of element positions</td></tr>
+  <tr><td>GMEM</td><td>Global Memory</td><td>GPU DRAM (HBM)</td></tr>
+  <tr><td>SMEM</td><td>Shared Memory</td><td>On-chip per-CTA scratchpad</td></tr>
+  <tr><td>RMEM</td><td>Register Memory</td><td>Per-thread register file</td></tr>
+  <tr><td>BM/BN/BK</td><td>Block M/N/K</td><td>CTA tile dimensions</td></tr>
+  <tr><td>TiledMma</td><td>Tiled MMA</td><td>MMA atom replicated across threads + positions</td></tr>
+  <tr><td>thrfrg_C</td><td>Thread-Fragment C</td><td>Algorithm: partition C into thread and fragment dims</td></tr>
+</table>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="principle">🟣 Core Principle: Layout Composition as Function Composition</h2>
+<!-- ============================================================ -->
+
+<div class="card principle">
+  <h3>The Key Idea</h3>
+  <p>A CuTe <strong>Layout = Shape + Stride</strong> is a <em>function</em> from logical coordinates to memory offsets.</p>
+  <div class="formula">
+    Layout(coord) = dot(coord, stride) → memory offset
+  </div>
+  <p>For example, <span class="inline-code">(128, 128):(128, 1)</span> is the function:</p>
+  <div class="formula">
+    f(m, n) = m × 128 + n × 1
+  </div>
+
+  <h3 style="margin-top:1rem">Why Layout Algebra?</h3>
+  <p><span class="highlight-purple">partition_C</span> needs to answer: "Given that thread 0 owns M-positions {0,1,2,3,64,65,66,67} and N-positions {0,1,2,3,64,65,66,67}, what is the layout that maps a flat index 0..63 to the correct memory offsets?"</p>
+  <p style="margin-top:0.5rem">Instead of computing 64 offsets explicitly, CuTe <strong>composes layout functions</strong>. The output is a new layout (pure metadata, no data movement) whose strides encode the answer.</p>
+
+  <h3 style="margin-top:1rem">Three Primitive Operations</h3>
+  <div class="two-col" style="margin-top:0.5rem">
+    <div class="card" style="border-left: 3px solid var(--step1)">
+      <p><span class="highlight"><code>logical_divide(A, B)</code></span></p>
+      <p style="font-size:0.85rem; margin-top:0.3rem"><strong>Splits</strong> layout A using tiler B.<br>
+      Math: <code>A ∘ (B, B*)</code> where B* = complement of B.</p>
+      <p style="font-size:0.85rem; margin-top:0.3rem">Shape transforms: <code>(M) → (TileM, RestM)</code></p>
+      <p style="font-size:0.85rem; color:var(--dim)">Like <code>reshape(128) → (64, 2)</code> but respecting the stride structure</p>
+    </div>
+    <div class="card" style="border-left: 3px solid var(--step2)">
+      <p><span class="highlight-green"><code>zipped_divide(A, B)</code></span></p>
+      <p style="font-size:0.85rem; margin-top:0.3rem">= <code>logical_divide</code> + <strong>zip</strong>: groups all tile dims together and all rest dims together.</p>
+      <p style="font-size:0.85rem; margin-top:0.3rem"><code>((TileM,RestM),(TileN,RestN))</code><br>
+        → <code>((TileM,TileN),(RestM,RestN))</code></p>
+      <p style="font-size:0.85rem; color:var(--dim)">Makes the "atom" part and "rest" part independently addressable</p>
+    </div>
+  </div>
+  <div class="card" style="border-left: 3px solid var(--step3); max-width: 50%; margin: 0.5rem auto;">
+    <p><span class="highlight-yellow"><code>compose(A, B)</code></span></p>
+    <p style="font-size:0.85rem; margin-top:0.3rem"><strong>Function composition</strong>: new_layout(x) = A(B(x))</p>
+    <p style="font-size:0.85rem; margin-top:0.3rem">Transforms coordinate space without touching data.</p>
+    <p style="font-size:0.85rem; color:var(--dim)">Like: B maps (thread, value) → atom coords; A maps atom coords → memory</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="inputs">📥 Concrete Inputs (Step 1 Example)</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+  <div class="two-col">
+    <div>
+      <h3>The Tensor</h3>
+      <div class="code">gC = (128, 128):(128, 1)
+  ↑ shape    ↑ stride
+  128 rows × 128 cols, row-major
+  f(m,n) = m*128 + n</div>
+    </div>
+    <div>
+      <h3>The TiledMma</h3>
+      <div class="code">Atom:        1×1×1 scalar FMA
+AtomLayoutC: (1, 1):(0, 0)   ← TV layout
+             1 thread, 1 value per atom
+
+atoms_layout: (16, 16, 1):(16, 1, 0)
+              256 threads as 16×16 M×N grid
+
+permutation_M: (16, 4):(4, 1)
+permutation_N: (16, 4):(4, 1)
+  product = 16×4 = 64 positions per dim
+  128/64 = 2 repetitions needed</div>
+    </div>
+  </div>
+
+  <h3 style="margin-top:1rem">What does permutation <span class="inline-code">(16, 4):(4, 1)</span> mean?</h3>
+  <p style="font-size:0.85rem; margin-top:0.3rem">It maps a 2D coordinate (f, r) where f∈[0,16), r∈[0,4) to position: <span class="inline-code">f*4 + r*1</span></p>
+  <p style="font-size:0.85rem">For thread 0 (f=0): positions are {0, 1, 2, 3} — the first 4 consecutive elements.</p>
+  <p style="font-size:0.85rem">For thread 1 (f=1): positions are {4, 5, 6, 7} — the next 4 elements.</p>
+  <p style="font-size:0.85rem">This covers 64 positions total (0..63). The tile is 128, so there's a "Rest" factor of 2 for positions {64..127}.</p>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="pipeline">🔄 The 5-Step Pipeline</h2>
+<!-- ============================================================ -->
+
+<div class="pipeline">
+  <div class="pipeline-box" style="border-color: var(--fg);">
+    <div style="font-size:0.7rem; color:var(--dim)">INPUT</div>
+    <div>(128,128)</div>
+    <div style="font-size:0.7rem">(128,1)</div>
+  </div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-box" style="border-color: var(--step1);">
+    <div style="font-size:0.7rem; color:var(--step1)">① logical_divide</div>
+    <div>Split by perm</div>
+  </div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-box" style="border-color: var(--step2);">
+    <div style="font-size:0.7rem; color:var(--step2)">② zipped_divide</div>
+    <div>Group atom+rest</div>
+  </div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-box" style="border-color: var(--step3);">
+    <div style="font-size:0.7rem; color:var(--step3)">③ compose</div>
+    <div>MN → TV</div>
+  </div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-box" style="border-color: var(--step4);">
+    <div style="font-size:0.7rem; color:var(--step4)">④ zipped_divide</div>
+    <div>Group thr+frg</div>
+  </div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-box" style="border-color: var(--step5);">
+    <div style="font-size:0.7rem; color:var(--step5)">⑤ slice</div>
+    <div>Pick thread 0</div>
+  </div>
+  <div class="pipeline-arrow">→</div>
+  <div class="pipeline-box" style="border-color: var(--green);">
+    <div style="font-size:0.7rem; color:var(--dim)">OUTPUT</div>
+    <div>(1,(4,2),(4,2))</div>
+    <div style="font-size:0.7rem">(0,(128,8192),(1,64))</div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="step1">① logical_divide — Split Layout by Permutation</h2>
+<!-- ============================================================ -->
+
+<div class="card step step1">
+  <h3>C++ Source (mma_atom.hpp:256-258)</h3>
+  <div class="code">auto t_tile = make_tile(<span class="highlight">permutation_mnk&lt;0&gt;()</span>,    // permutation_M
+                        <span class="highlight">permutation_mnk&lt;1&gt;()</span>);   // permutation_N
+auto t_tensor = <span class="highlight">logical_divide</span>(ctensor, t_tile);  // (PermM, PermN)</div>
+
+  <h3>What It Does</h3>
+  <p>Splits each dimension of gC according to the permutation layout. The permutation <span class="inline-code">(16,4):(4,1)</span> covers 64 of the 128 positions, leaving a "rest" factor of 2.</p>
+
+  <h3 style="margin-top:0.8rem">Math: A ∘ (B, B*)</h3>
+  <p style="font-size:0.85rem">For the M dimension (size 128, stride 128):</p>
+  <div class="code">B   = permutation_M = (16, 4):(4, 1)       — covers 64 positions: {0,4,8,...,60, 1,5,...,61, 2,...,62, 3,...,63}
+B*  = complement(B, 128) = (2):(64)        — the 2 remaining tiles: {0, 64}
+
+(B, B*) = ((16, 4), 2):((4, 1), 64)       — full factorization of 128 positions
+
+Compose with M-stride=128:
+  stride((16, 4), 2) = ((4×128, 1×128), 64×128) = <span class="highlight">((512, 128), 8192)</span></div>
+
+  <p style="font-size:0.85rem; margin-top:0.5rem">For the N dimension (size 128, stride 1):</p>
+  <div class="code">Same structure, but base stride is 1 instead of 128:
+  stride((16, 4), 2) = ((4×1, 1×1), 64×1) = <span class="highlight">((4, 1), 64)</span></div>
+
+  <div class="transform-viz">
+    <div class="transform-row">
+      <span class="transform-label">Input:</span>
+      <span class="transform-content"><span class="highlight">(128, 128):(128, 1)</span></span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--step1)">Output:</span>
+      <span class="transform-content"><span class="highlight">((16,4,2), (16,4,2)):((512,128,8192), (4,1,64))</span></span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label">Meaning:</span>
+      <span class="transform-content" style="font-size:0.8rem">
+        M split → (<span style="color:var(--step1)">F=16 thread-groups</span>, <span style="color:var(--green)">R=4 consecutive</span>, <span style="color:var(--yellow)">Rest=2 repetitions</span>)<br>
+        N split → (<span style="color:var(--step1)">F=16 thread-groups</span>, <span style="color:var(--green)">R=4 consecutive</span>, <span style="color:var(--yellow)">Rest=2 repetitions</span>)
+      </span>
+    </div>
+  </div>
+
+  <h3>Visualization: M-dimension split</h3>
+  <p style="font-size:0.8rem; color:var(--dim); margin-bottom:0.5rem">128 M-positions factored as (16 groups × 4 consecutive) × 2 repetitions</p>
+  <div style="font-size:0.75rem; overflow-x:auto;">
+    <div style="display:flex; gap:2px; flex-wrap:wrap; max-width:700px;">
+      <div style="display:flex; gap:1px;">
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);" title="Thread 0, group 0">0</div>
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);">1</div>
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);">2</div>
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);">3</div>
+      </div>
+      <div style="display:flex; gap:1px;">
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">4</div>
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">5</div>
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">6</div>
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">7</div>
+      </div>
+      <div style="color:var(--dim); padding:2px;">...</div>
+      <div style="display:flex; gap:1px;">
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">60</div>
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">61</div>
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">62</div>
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">63</div>
+      </div>
+      <div style="color:var(--dim); padding:2px;">|</div>
+      <div style="display:flex; gap:1px;">
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);" title="Thread 0, rep 1">64</div>
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);">65</div>
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);">66</div>
+        <div style="background:#1a3a5c; padding:2px 4px; border-radius:2px; color:var(--step1);">67</div>
+      </div>
+      <div style="display:flex; gap:1px;">
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">68</div>
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">69</div>
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">70</div>
+        <div style="background:#2a2a1c; padding:2px 4px; border-radius:2px; color:var(--yellow);">71</div>
+      </div>
+      <div style="color:var(--dim); padding:2px;">...</div>
+      <div style="display:flex; gap:1px;">
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">124</div>
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">…</div>
+        <div style="background:#2a1a2a; padding:2px 4px; border-radius:2px; color:var(--purple);">127</div>
+      </div>
+    </div>
+    <div style="margin-top:0.3rem; display:flex; gap:1rem;">
+      <span style="color:var(--step1)">■ Thread 0 (F=0)</span>
+      <span style="color:var(--yellow)">■ Thread 1 (F=1)</span>
+      <span style="color:var(--purple)">■ Thread 15 (F=15)</span>
+      <span style="color:var(--dim)">| = Rest boundary (pos 64)</span>
+    </div>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="step2">② zipped_divide — Group Atom Dimensions Together</h2>
+<!-- ============================================================ -->
+
+<div class="card step step2">
+  <h3>C++ Source (mma_atom.hpp:261-263)</h3>
+  <div class="code">auto c_tile = make_tile(make_layout(size&lt;0&gt;(AtomShape_MNK{})),   // AtomM = 1
+                        make_layout(size&lt;1&gt;(AtomShape_MNK{})));  // AtomN = 1
+auto c_tensor = <span class="highlight-green">zipped_divide</span>(t_tensor, c_tile);  // ((AtomM,AtomN),(RestM,RestN))</div>
+
+  <h3>What It Does</h3>
+  <p>Groups "atom" dimensions (the elements consumed by one MMA instruction) into one mode, and "rest" dimensions (how many atom invocations are needed) into another.</p>
+
+  <h3 style="margin-top:0.8rem">Why?</h3>
+  <p style="font-size:0.85rem">Step 3 needs to apply the TV (Thread-Value) layout <em>within</em> the atom. By zipping atom dimensions together, the atom mode becomes a self-contained unit we can transform independently.</p>
+
+  <h3 style="margin-top:0.8rem">Derivation</h3>
+  <div class="code">c_tile = (1, 1) — atom covers 1×1 elements (scalar FMA)
+
+zipped_divide splits by (1, 1), which is trivial:
+  Each (16,4,2) subgroup in M: atom takes 1, rest gets (16,4,2)
+  Each (16,4,2) subgroup in N: atom takes 1, rest gets (16,4,2)
+
+Then zip: atom parts → mode 0, rest parts → mode 1</div>
+
+  <div class="transform-viz">
+    <div class="transform-row">
+      <span class="transform-label">Input:</span>
+      <span class="transform-content">((16,4,2), (16,4,2)):((512,128,8192), (4,1,64))</span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--step2)">Output:</span>
+      <span class="transform-content"><span class="highlight-green">((1, 1), (16,4,2, 16,4,2)):((★, ★), (512,128,8192, 4,1,64))</span></span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label">Modes:</span>
+      <span class="transform-content" style="font-size:0.8rem">
+        Mode 0 = <span style="color:var(--step2)">Atom (1,1)</span>: one MMA invocation processes 1 element<br>
+        Mode 1 = <span style="color:var(--yellow)">Rest (16,4,2,16,4,2)</span>: 16384 total atom invocations to cover the tile
+      </span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--dim)">★ Note:</span>
+      <span class="transform-content" style="font-size:0.8rem; color:var(--dim)">Atom strides are "don't care" since atom is size 1×1.</span>
+    </div>
+  </div>
+
+  <div class="thought-bubble">
+    For a <strong>tensor core</strong> atom (e.g., 16×8×8 HMMA), the atom mode would be (16, 8) with meaningful strides, and the rest would be smaller. The structure of the algorithm stays the same — only the numbers change. This is the power of CuTe's generality.
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="step3">③ compose — Transform Atom from (M,N) to (Thread, Value)</h2>
+<!-- ============================================================ -->
+
+<div class="card step step3">
+  <h3>C++ Source (mma_atom.hpp:265-266)</h3>
+  <div class="code">// Transform the Atom mode from (M,N) to (Thr,Val)
+auto tv_tensor = c_tensor.<span class="highlight-yellow">compose</span>(AtomLayoutC_TV{}, _);  // ((ThrV,FrgV),(RestM,RestN))</div>
+
+  <h3>What It Does</h3>
+  <p>Applies the atom's <strong>TV (Thread-Value) layout</strong> to mode 0 (the atom). This re-labels atom coordinates from spatial (M, N) to functional (which thread, which value within that thread).</p>
+
+  <h3 style="margin-top:0.8rem">Why This Step Exists</h3>
+  <p style="font-size:0.85rem">The atom layout knows how a hardware MMA instruction distributes its inputs/outputs across threads. For example, a tensor core MMA might spread a 16×8 output across 32 threads, each holding 4 values. The TV layout encodes that hardware-specific mapping.</p>
+  <p style="font-size:0.85rem; margin-top:0.3rem">For our scalar FMA: 1 thread computes 1 value, so TV = (1,1):(0,0) — trivial.</p>
+
+  <h3 style="margin-top:0.8rem">Derivation</h3>
+  <div class="code">AtomLayoutC_TV = (1, 1):(0, 0)
+  ↑ 1 thread (ThrV), 1 value per atom (FrgV = Fragment Value)
+
+compose(atom_mode=(1,1), TV=(1,1)) → (ThrV=1, FrgV=1)
+  This is just relabeling — no numeric change.
+
+The "_" in compose(..., _) means: leave mode 1 (Rest) untouched.</div>
+
+  <div class="transform-viz">
+    <div class="transform-row">
+      <span class="transform-label">Input:</span>
+      <span class="transform-content">(<span style="color:var(--step2)">(1, 1)</span>, (16,4,2, 16,4,2))</span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--step3)">Output:</span>
+      <span class="transform-content"><span class="highlight-yellow">((<span style="color:var(--red)">ThrV=1</span>, <span style="color:var(--green)">FrgV=1</span>), (16,4,2, 16,4,2))</span></span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label">Strides:</span>
+      <span class="transform-content"><span class="highlight-yellow">((0, 0), (512,128,8192, 4,1,64))</span> — unchanged numerically</span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--dim)">Key:</span>
+      <span class="transform-content" style="font-size:0.8rem">
+        <span style="color:var(--red)">ThrV</span> = threads within atom (intra-atom thread index)<br>
+        <span style="color:var(--green)">FrgV</span> = values per thread within atom (fragment values)
+      </span>
+    </div>
+  </div>
+
+  <div class="thought-bubble">
+    <strong>For a 16×8 tensor core (HMMA):</strong> AtomLayoutC_TV would be e.g., <span class="inline-code">(32, 4):(some_strides)</span> — 32 threads each holding 4 values. Then compose would transform (16,8) → (32, 4) with non-trivial strides derived from the hardware's register layout. This is where CuTe encodes hardware knowledge.
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="step4">④ zipped_divide — Separate Thread-Indexing from Thread-Owned</h2>
+<!-- ============================================================ -->
+
+<div class="card step step4">
+  <h3>C++ Source (mma_atom.hpp:268-272)</h3>
+  <div class="code">// Tile the tensor for the C-threads
+auto thr_tile = make_tile(
+    _,                                                      // keep ThrV as-is
+    make_tile(make_layout(size&lt;1&gt;(thr_layout_vmnk_)),      // ThrM = 16
+              make_layout(size&lt;2&gt;(thr_layout_vmnk_))));    // ThrN = 16
+auto thr_tensor = <span class="highlight-purple">zipped_divide</span>(tv_tensor, thr_tile);  // ((ThrV,(ThrM,ThrN)),(FrgV,(RestM,RestN)))</div>
+
+  <h3>What It Does</h3>
+  <p>The "Rest" mode from step 3 contains both thread-indexing dimensions (which of the 16×16 threads) and per-thread-owned dimensions (the 4×2 elements each thread computes). This step separates them.</p>
+
+  <h3 style="margin-top:0.8rem">Why?</h3>
+  <p style="font-size:0.85rem">After this step, mode 0 = "which thread am I?" and mode 1 = "what data do I own?". The final slice (step 5) uses mode 0 to pick a thread and returns mode 1 as the result.</p>
+
+  <h3 style="margin-top:0.8rem">Derivation</h3>
+  <div class="code">thr_tile for mode 1 (Rest) = (ThrM=16, ThrN=16)
+
+Mode 1 was: (16, 4, 2, 16, 4, 2):(512, 128, 8192, 4, 1, 64)
+                M-part              N-part
+
+Divide M-rest (16, 4, 2) by ThrM=16:
+  • Tile: 16 positions (strides from F dimension) → stride <span class="highlight-purple">512</span>
+  • Rest: (4, 2) → strides <span class="highlight-purple">(128, 8192)</span>
+
+Divide N-rest (16, 4, 2) by ThrN=16:
+  • Tile: 16 positions → stride <span class="highlight-purple">4</span>
+  • Rest: (4, 2) → strides <span class="highlight-purple">(1, 64)</span>
+
+Zip → thread parts together, fragment parts together:</div>
+
+  <div class="transform-viz">
+    <div class="transform-row">
+      <span class="transform-label">Input:</span>
+      <span class="transform-content">((ThrV=1, FrgV=1), (<span style="color:var(--red)">16</span>,4,2, <span style="color:var(--red)">16</span>,4,2))</span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--step4)">Output:</span>
+      <span class="transform-content"><span class="highlight-purple">
+        ((<span style="color:var(--red)">1</span>, (<span style="color:var(--red)">16, 16</span>)), (<span style="color:var(--green)">1</span>, (<span style="color:var(--green)">4,2</span>), (<span style="color:var(--green)">4,2</span>)))
+      </span></span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label">Strides:</span>
+      <span class="transform-content"><span class="highlight-purple">
+        ((<span style="color:var(--red)">0</span>, (<span style="color:var(--red)">512, 4</span>)), (<span style="color:var(--green)">0</span>, (<span style="color:var(--green)">128,8192</span>), (<span style="color:var(--green)">1,64</span>)))
+      </span></span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label">Meaning:</span>
+      <span class="transform-content" style="font-size:0.8rem">
+        Mode 0 = <span style="color:var(--red)">Thread selector</span>: (ThrV=1, (ThrM=16, ThrN=16)) — picks one of 256 threads<br>
+        Mode 1 = <span style="color:var(--green)">Fragment</span>: (FrgV=1, (RestM=(4,2)), (RestN=(4,2))) — 64 elements this thread owns
+      </span>
+    </div>
+  </div>
+
+  <h3>Thread Indexing Strides Explained</h3>
+  <div class="code">Thread (tm, tn) where tm ∈ [0,16), tn ∈ [0,16):
+
+  offset = tm × 512 + tn × 4
+
+  tm=0, tn=0: offset = 0      → row 0, col 0
+  tm=0, tn=1: offset = 4      → row 0, col 4
+  tm=1, tn=0: offset = 512    → row 4, col 0   (512/128 = row 4)
+  tm=1, tn=1: offset = 516    → row 4, col 4
+
+Thread 0 (tm=0, tn=0) starts at (row=0, col=0)
+Thread 1 (tm=0, tn=1) starts at (row=0, col=4)
+Thread 16 (tm=1, tn=0) starts at (row=4, col=0)
+Thread 255 (tm=15, tn=15) starts at (row=60, col=60)</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="step5">⑤ slice — Pick One Thread's Fragment</h2>
+<!-- ============================================================ -->
+
+<div class="card step step5">
+  <h3>C++ Source (mma_atom.hpp:469-472)</h3>
+  <div class="code">// In partition_C:
+auto thr_vmn = make_coord(get&lt;0&gt;(thr_vmnk_),                    // thr_v = 0
+                          make_coord(get&lt;1&gt;(thr_vmnk_),          // thr_m
+                                     get&lt;2&gt;(thr_vmnk_)));       // thr_n
+return thr_tensor(thr_vmn, make_coord(_, repeat&lt;...&gt;(_)));       // → fragment view</div>
+
+  <h3>What It Does</h3>
+  <p>Plugs in the concrete thread coordinates into mode 0 (the thread selector). This computes a pointer offset for this thread and returns mode 1 (the fragment) as the result layout.</p>
+
+  <h3 style="margin-top:0.8rem">Derivation for Thread 0</h3>
+  <div class="code">Thread 0: thr_vmnk = (0, 0, 0, 0)
+  → thr_vmn = (v=0, (m=0, n=0))
+
+Pointer offset = 0×0 + 0×512 + 0×4 = <span class="highlight-orange">0</span> (no shift — thread 0 starts at gC's base)
+
+Remaining layout (mode 1) = the fragment:
+  <span class="highlight-orange">(1, (4,2), (4,2)):(0, (128,8192), (1,64))</span></div>
+
+  <div class="transform-viz">
+    <div class="transform-row">
+      <span class="transform-label">Input:</span>
+      <span class="transform-content">((<span style="color:var(--red)">1,(16,16)</span>), (<span style="color:var(--green)">1,(4,2),(4,2)</span>)) — full thrfrg_C result</span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label">Slice:</span>
+      <span class="transform-content">thread_coord = (<span style="color:var(--red)">0, (0, 0)</span>), fragment_coord = (<span style="color:var(--green)">_, (_, _), (_, _)</span>)</span>
+    </div>
+    <div class="transform-row">
+      <span class="transform-label" style="color:var(--step5)">Output:</span>
+      <span class="transform-content"><span class="highlight-orange">(1, (4,2), (4,2)):(0, (128,8192), (1,64))</span> — thread 0's view of gC</span>
+    </div>
+  </div>
+
+  <h3 style="margin-top:0.8rem">What the Output Strides Mean Physically</h3>
+  <div class="code" style="font-size:0.83rem">tCgC[v, (m0,m1), (n0,n1)] → gC offset = v×0 + m0×128 + m1×8192 + n0×1 + n1×64
+
+The 64 elements thread 0 owns (m0∈[0,4), m1∈[0,2), n0∈[0,4), n1∈[0,2)):
+
+  (m0,m1,n0,n1) → (row, col) = (m0 + m1×64, n0 + n1×64)
+
+   n1=0              n1=1
+   n0: 0  1  2  3    n0: 0  1  2  3
+m1=0 m0=0: (0,0) (0,1) (0,2) (0,3)    (0,64) (0,65) (0,66) (0,67)
+     m0=1: (1,0) (1,1) (1,2) (1,3)    (1,64) (1,65) (1,66) (1,67)
+     m0=2: (2,0) (2,1) (2,2) (2,3)    (2,64) (2,65) (2,66) (2,67)
+     m0=3: (3,0) (3,1) (3,2) (3,3)    (3,64) (3,65) (3,66) (3,67)
+
+m1=1 m0=0: (64,0) (64,1) (64,2) (64,3)    (64,64) (64,65) (64,66) (64,67)
+     m0=1: (65,0) (65,1) (65,2) (65,3)    (65,64) (65,65) (65,66) (65,67)
+     m0=2: (66,0) (66,1) (66,2) (66,3)    (66,64) (66,65) (66,66) (66,67)
+     m0=3: (67,0) (67,1) (67,2) (67,3)    (67,64) (67,65) (67,66) (67,67)</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="verify">✓ Verification: 16×16 Thread Ownership Grid</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+  <p>Each of 256 threads owns a 4×4 block at position (tm×4, tn×4) <em>and</em> a mirror at (+64, +64). Four 4×4 blocks = 64 elements. Let's visualize thread ownership for the first 16×16 corner of the 128×128 C tile:</p>
+  <div id="thread-grid"></div>
+  <p style="font-size:0.8rem; color:var(--dim); margin-top:0.5rem">Each colored 4×4 block is one thread's first sub-block. Thread numbers shown. The second sub-block at (+64,+64) follows the same pattern.</p>
+
+  <h3 style="margin-top:1rem">Element Count Check</h3>
+  <div class="code">Thread 0 owns: 1 × (4×2) × (4×2) = 1 × 8 × 8 = <span class="highlight-green">64 elements</span>
+256 threads × 64 = <span class="highlight-green">16,384 = 128 × 128</span> ✓
+
+No element is claimed by two threads (permutation is a bijection).
+No element is unclaimed (complement covers the remainder).</div>
+</div>
+
+<!-- ============================================================ -->
+<h2>🎯 Summary: Why Each Step Exists</h2>
+<!-- ============================================================ -->
+
+<div class="card">
+<table class="abbr-table">
+  <tr>
+    <th>Step</th><th>Operation</th><th>Problem It Solves</th><th>Output Shape</th>
+  </tr>
+  <tr>
+    <td style="color:var(--step1)">①</td>
+    <td>logical_divide</td>
+    <td>Factorize the tile according to the thread permutation — separate "which group" from "position within group"</td>
+    <td>((16,4,2),(16,4,2))</td>
+  </tr>
+  <tr>
+    <td style="color:var(--step2)">②</td>
+    <td>zipped_divide</td>
+    <td>Isolate the atom's footprint (what one MMA instruction touches) from the rest (how many times we repeat)</td>
+    <td>((1,1),(16,4,2,16,4,2))</td>
+  </tr>
+  <tr>
+    <td style="color:var(--step3)">③</td>
+    <td>compose</td>
+    <td>Re-label atom coordinates from spatial (M,N) to functional (Thread, Value) using hardware knowledge</td>
+    <td>((ThrV,FrgV),(Rest...))</td>
+  </tr>
+  <tr>
+    <td style="color:var(--step4)">④</td>
+    <td>zipped_divide</td>
+    <td>Separate thread-indexing dimensions from per-thread fragment dimensions across the "rest" mode</td>
+    <td>((Thr),(Frg))</td>
+  </tr>
+  <tr>
+    <td style="color:var(--step5)">⑤</td>
+    <td>slice</td>
+    <td>Plug in a concrete thread ID and return just that thread's fragment layout</td>
+    <td>(1,(4,2),(4,2))</td>
+  </tr>
+</table>
+</div>
+
+<div class="card principle">
+  <h3>The Design Principle</h3>
+  <p>CuTe decomposes the "which thread owns which elements" problem into <strong>composable algebraic primitives</strong> — divide, zip, compose, slice — each handling one concern:</p>
+  <ol style="margin-top:0.5rem; padding-left:1.5rem; font-size:0.9rem;">
+    <li><strong>Spatial structure</strong> (how elements are arranged in memory)</li>
+    <li><strong>Hardware structure</strong> (how the MMA instruction maps threads to elements)</li>
+    <li><strong>Tiling structure</strong> (how many atoms tile across the output)</li>
+  </ol>
+  <p style="margin-top:0.5rem">By keeping these orthogonal, the same code works for a scalar FMA atom, a 16×8×8 tensor core, or a 64×256×32 Blackwell UMMA — only the atom's TV layout changes. The algorithm is invariant to the hardware.</p>
+</div>
+
+<script>
+// Generate thread ownership grid for first 16×16 corner
+const grid = document.getElementById('thread-grid');
+const colors = [
+  '#1a3a5c','#3a5c1a','#5c1a3a','#5c5c1a',
+  '#1a5c5c','#5c3a1a','#3a1a5c','#1a5c3a',
+  '#4a2a5c','#5c2a4a','#2a5c4a','#4a5c2a',
+  '#2a4a5c','#5c4a2a','#4a2a2a','#2a4a2a'
+];
+
+let html = '<div class="grid-16x16">';
+for (let row = 0; row < 16; row++) {
+  for (let col = 0; col < 16; col++) {
+    // Thread mapping: tm = row/4 (which 4-row group), tn = col/4
+    // But within the permutation (16,4):(4,1), thread F-index = position/4
+    const tm = Math.floor(row / 4);  // 0..3 for first 16 rows
+    const tn = Math.floor(col / 4);
+    const thrIdx = tm * 16 + tn;     // thread index in the 16×16 grid
+    const bgColor = colors[thrIdx % 16];
+    html += `<div class="g-cell" style="background:${bgColor}" title="row=${row}, col=${col}, thread=${thrIdx}">${thrIdx}</div>`;
+  }
+}
+html += '</div>';
+html += '<div style="font-size:0.7rem; color:var(--dim); text-align:center; margin-top:0.3rem;">First 16×16 corner: rows 0-15, cols 0-15. Each 4×4 block = one thread.</div>';
+grid.innerHTML = html;
+</script>
+
+</body>
+</html>

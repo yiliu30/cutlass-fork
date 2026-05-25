@@ -1,0 +1,514 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>CuTe GEMM Kernel Design — The Big Picture</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; background: #1a1a2e; color: #e0e0e0; line-height: 1.7; }
+  h1 { color: #76b900; text-align: center; margin-bottom: 0.3rem; }
+  h2 { color: #76b900; border-bottom: 2px solid #333; padding-bottom: 0.3rem; margin-top: 2.5rem; }
+  h3 { color: #00bcd4; margin-top: 1.5rem; }
+  .subtitle { text-align: center; color: #aaa; margin-bottom: 2rem; }
+  pre { background: #0f0f23; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.82rem; line-height: 1.5; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0f0f23; padding: 0.1rem 0.4rem; border-radius: 3px; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { padding: 0.6rem 0.8rem; text-align: left; border: 1px solid #333; font-size: 0.9rem; }
+  th { background: #16213e; color: #76b900; }
+  tr:nth-child(even) { background: #1a1a3e; }
+  .box { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #333; margin: 1rem 0; }
+  .box.green { border-left: 4px solid #76b900; }
+  .box.blue { border-left: 4px solid #00bcd4; }
+  .box.orange { border-left: 4px solid #ff9800; }
+  .box.red { border-left: 4px solid #f44336; }
+  .diagram { background: #0f0f23; padding: 1.5rem; border-radius: 8px; font-family: monospace; white-space: pre; overflow-x: auto; font-size: 0.82rem; line-height: 1.4; }
+  .hl { color: #76b900; font-weight: bold; }
+  .h2c { color: #00bcd4; }
+  .warn { color: #ff9800; }
+  .red { color: #f44336; }
+  .dim { color: #666; }
+
+  .flow-container { display: flex; flex-direction: column; gap: 0; align-items: center; margin: 2rem 0; }
+  .flow-layer { width: 90%; max-width: 800px; padding: 1.2rem; border-radius: 8px; position: relative; }
+  .flow-layer.hardware { background: #2a1a1a; border: 2px solid #f44336; }
+  .flow-layer.atom { background: #2a2a1a; border: 2px solid #ff9800; }
+  .flow-layer.problem { background: #1a1a2a; border: 2px solid #00bcd4; }
+  .flow-layer.user { background: #1a2a1a; border: 2px solid #76b900; }
+  .flow-layer.derived { background: #1a1a2a; border: 2px dashed #888; }
+  .flow-layer.kernel { background: #2a1a2a; border: 2px solid #ce93d8; }
+  .flow-arrow { font-size: 1.5rem; color: #666; text-align: center; margin: -0.3rem 0; }
+  .flow-label { position: absolute; right: 1rem; top: 0.5rem; font-size: 0.75rem; padding: 0.2rem 0.5rem; border-radius: 3px; }
+  .label-fixed { background: #f44336; color: #fff; }
+  .label-given { background: #00bcd4; color: #000; }
+  .label-choice { background: #76b900; color: #000; }
+  .label-auto { background: #666; color: #fff; }
+  .label-result { background: #ce93d8; color: #000; }
+
+  .phase { display: flex; gap: 1rem; align-items: stretch; margin: 1rem 0; }
+  .phase-num { background: #76b900; color: #000; min-width: 2.5rem; height: 2.5rem; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; font-size: 1.2rem; flex-shrink: 0; }
+  .phase-content { flex: 1; background: #16213e; border-radius: 8px; padding: 1rem; border: 1px solid #333; }
+  .phase-content h3 { margin-top: 0; }
+
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin: 1rem 0; }
+  @media (max-width: 768px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>CuTe GEMM Kernel Design — The Big Picture</h1>
+<p class="subtitle">A roadmap for designing a high-performance GEMM kernel using CuTe DSL</p>
+
+<!-- =================================================================== -->
+<h2>1. The High-Level Flow (30-Second Overview)</h2>
+
+<div class="diagram">
+<span class="hl">You want:</span>  C[M,N] = A[M,K] × B[N,K]    (matrix multiply)
+
+<span class="hl">You write:</span>
+
+  Host (@cute.jit):
+    1. Pick an MMA atom           ← what hardware instruction?
+    2. Pick atoms_layout          ← how many warps?
+    3. Pick permutation           ← how to tile across the CTA?
+    4. Pick tile sizes (BM,BN,BK) ← how big is each thread block's work?
+    5. Launch kernel
+
+  Kernel (@cute.kernel):
+    A. local_tile    → extract this CTA's data from global memory
+    B. partition_C   → figure out this thread's output elements
+    C. K-loop        → load data, call cute.gemm, accumulate
+    D. epilogue      → store results back to global memory
+
+<span class="hl">CuTe handles:</span>
+    All index math, thread→element mapping, address computation.
+    You just describe "what" — CuTe derives "how."
+</div>
+
+<!-- =================================================================== -->
+<h2>2. The Layer Diagram — What's Fixed, What's Chosen, What's Derived</h2>
+
+<div class="flow-container">
+
+<div class="flow-layer hardware">
+  <span class="flow-label label-fixed">FIXED BY HARDWARE</span>
+  <h3 style="margin-top:0; color:#f44336;">Layer 1: Hardware (NVIDIA ISA)</h3>
+  <p style="margin-bottom:0.5rem;">The MMA instruction's properties — baked in silicon, can't change.</p>
+  <table style="margin:0;">
+    <tr><td>Instruction</td><td><code>fma.rn.f32</code> or <code>mma.sync.m16n8k16</code> or <code>wgmma.m64n256k16</code></td></tr>
+    <tr><td>Atom shape (M,N,K)</td><td>(1,1,1) or (16,8,16) or (64,256,16)</td></tr>
+    <tr><td>Threads per atom</td><td>1 or 32 (warp) or 128 (warpgroup)</td></tr>
+    <tr><td>Values per thread (V)</td><td>1 or 4 or more</td></tr>
+    <tr><td>TV_layout strides</td><td>The exact thread→element wiring</td></tr>
+    <tr><td>Data types</td><td>fp32, fp16→fp32, fp16→fp16, etc.</td></tr>
+  </table>
+</div>
+
+<div class="flow-arrow">↓ encoded as</div>
+
+<div class="flow-layer atom">
+  <span class="flow-label label-fixed">FIXED (wrapper)</span>
+  <h3 style="margin-top:0; color:#ff9800;">Layer 2: Atom (CuTe Encoding)</h3>
+  <p style="margin-bottom:0.5rem;">CuTe's layout-based encoding of the hardware truth. One-to-one mapping.</p>
+  <table style="margin:0;">
+    <tr><td>TV_layout_C</td><td><code>((4,8),(2,2)):((16,1),(8,64))</code> for m16n8k16</td></tr>
+    <tr><td>TV_layout_A</td><td>How A-elements map to threads (ISA-defined)</td></tr>
+    <tr><td>TV_layout_B</td><td>How B-elements map to threads (ISA-defined)</td></tr>
+  </table>
+</div>
+
+<div class="flow-arrow">↓ + ↓</div>
+
+<div class="flow-layer problem">
+  <span class="flow-label label-given">GIVEN BY PROBLEM</span>
+  <h3 style="margin-top:0; color:#00bcd4;">Problem Inputs</h3>
+  <p style="margin-bottom:0.5rem;">What your application hands you. Not free choices.</p>
+  <table style="margin:0;">
+    <tr><td>Matrix dimensions</td><td>M, N, K (e.g., 4096×4096×4096)</td></tr>
+    <tr><td>Data layouts</td><td>A: (M,K):(1,M), B: (N,K):(1,N), C: (M,N):(N,1)</td></tr>
+    <tr><td>Data types</td><td>fp16 inputs, fp32 accumulator, fp16 output</td></tr>
+  </table>
+</div>
+
+<div class="flow-arrow">↓ your engineering decisions ↓</div>
+
+<div class="flow-layer user">
+  <span class="flow-label label-choice">YOUR DESIGN CHOICES</span>
+  <h3 style="margin-top:0; color:#76b900;">Layer 3: TiledMMA + Kernel Config</h3>
+  <p style="margin-bottom:0.5rem;">The tuning knobs you control. This is where kernel optimization lives.</p>
+  <table style="margin:0;">
+    <tr><td><code>atoms_layout</code></td><td>How many atoms (warps) per CTA — e.g., (2,2,1) = 4 warps</td></tr>
+    <tr><td><code>permutation</code></td><td>Coverage expansion + element pattern — e.g., (32,32,16)</td></tr>
+    <tr><td><code>BM, BN, BK</code></td><td>CTA tile size — e.g., 128×128×32</td></tr>
+    <tr><td><code>NUM_STAGES</code></td><td>Pipeline depth — e.g., 3 async stages</td></tr>
+    <tr><td>Copy atoms</td><td>Which load/store instructions — cp.async, ldmatrix, etc.</td></tr>
+    <tr><td>SMEM layout</td><td>Swizzle pattern for bank-conflict-free access</td></tr>
+  </table>
+</div>
+
+<div class="flow-arrow">↓ CuTe derives everything below ↓</div>
+
+<div class="flow-layer derived">
+  <span class="flow-label label-auto">AUTO-DERIVED</span>
+  <h3 style="margin-top:0; color:#888;">Derived Quantities (You Don't Compute These)</h3>
+  <table style="margin:0;">
+    <tr><td>Thread→element mapping</td><td>From atom TV + atoms_layout + permutation</td></tr>
+    <tr><td><code>partition_C/A/B</code> shapes</td><td>(V, M_rest, N_rest) — each thread's view</td></tr>
+    <tr><td>Registers per thread</td><td>V × M_rest × N_rest (accumulator count)</td></tr>
+    <tr><td>Grid dimensions</td><td>ceil(M/BM) × ceil(N/BN)</td></tr>
+    <tr><td>K-iterations</td><td>K / BK (outer), BK / atom_K (inner)</td></tr>
+    <tr><td>SMEM size</td><td>(BM×BK + BN×BK) × dtype_size × NUM_STAGES</td></tr>
+    <tr><td>Copy tiling</td><td>How threads cooperate on G→S and S→R transfers</td></tr>
+  </table>
+</div>
+
+<div class="flow-arrow">↓ produces ↓</div>
+
+<div class="flow-layer kernel">
+  <span class="flow-label label-result">THE KERNEL</span>
+  <h3 style="margin-top:0; color:#ce93d8;">Running Kernel</h3>
+  <p>A compiled PTX kernel that executes the GEMM with all the above baked in as constants.</p>
+</div>
+
+</div>
+
+<!-- =================================================================== -->
+<h2>3. The Kernel Structure (What You Actually Write)</h2>
+
+<div class="diagram">
+<span class="hl">━━━ HOST SIDE (@cute.jit) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+
+  ┌─────────────────────────────────────────────────────┐
+  │  1. Create MMA atom (pick the hardware instruction) │
+  │  2. Create TiledMMA (atom + layout + permutation)   │
+  │  3. Create copy atoms (G→S, S→R copy instructions)  │
+  │  4. Define SMEM layouts (with swizzle)              │
+  │  5. Compute grid = ceil_div(problem, tile)          │
+  │  6. Launch kernel                                    │
+  └─────────────────────────────────────────────────────┘
+
+<span class="hl">━━━ KERNEL SIDE (@cute.kernel) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</span>
+
+  ┌─────────────────────────────────────────────────────┐
+  │  <span class="h2c">A. TILE</span> — Extract this CTA's work from global memory │
+  │     gA = local_tile(mA, tiler, coord, proj)         │
+  │     gB = local_tile(mB, tiler, coord, proj)         │
+  │     gC = local_tile(mC, tiler, coord, proj)         │
+  ├─────────────────────────────────────────────────────┤
+  │  <span class="h2c">B. PARTITION</span> — What does THIS thread own?           │
+  │     thr_mma = tiled_mma.get_slice(tidx)             │
+  │     tCgC = thr_mma.partition_C(gC)                  │
+  │     tCrC = make_fragment_C(tCgC)  → accumulators    │
+  │     tCrC.fill(0)                                    │
+  ├─────────────────────────────────────────────────────┤
+  │  <span class="h2c">C. K-LOOP</span> — The main compute loop                  │
+  │     for k_tile in range(num_k_tiles):               │
+  │         [Load A,B: GMEM → SMEM → Registers]        │
+  │         [Compute: cute.gemm(tiled_mma, ...)]        │
+  │         [Pipeline: commit/wait for next tile]       │
+  ├─────────────────────────────────────────────────────┤
+  │  <span class="h2c">D. EPILOGUE</span> — Store results                       │
+  │     cute.copy(atom, tCrC, tCgC)  → registers→GMEM  │
+  └─────────────────────────────────────────────────────┘
+</div>
+
+<!-- =================================================================== -->
+<h2>4. The Design Decision Tree</h2>
+
+<p>When designing a GEMM kernel, decisions flow in this order:</p>
+
+<div class="phase">
+  <div class="phase-num">1</div>
+  <div class="phase-content">
+    <h3>Choose the Atom (Which Instruction?)</h3>
+    <p>Based on your GPU architecture and data types:</p>
+    <table>
+      <tr><th>GPU</th><th>Data Type</th><th>Atom</th><th>Shape</th><th>Threads</th></tr>
+      <tr><td>Any</td><td>fp32</td><td>MmaUniversalOp</td><td>(1,1,1)</td><td>1</td></tr>
+      <tr><td>SM80 (Ampere)</td><td>fp16</td><td>MmaF16BF16Op</td><td>(16,8,16)</td><td>32</td></tr>
+      <tr><td>SM90 (Hopper)</td><td>fp16</td><td>GMMA</td><td>(64,N,16)</td><td>128</td></tr>
+      <tr><td>SM100 (Blackwell)</td><td>fp16/fp4</td><td>UMMA</td><td>(varies)</td><td>128</td></tr>
+    </table>
+    <p class="dim">This is usually obvious from your target GPU and data type.</p>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-num">2</div>
+  <div class="phase-content">
+    <h3>Choose atoms_layout (How Many Warps?)</h3>
+    <p>Decide how many atoms work together in one CTA:</p>
+    <div class="diagram" style="padding:0.8rem;">
+NUM_THREADS = product(atoms_layout) × threads_per_atom
+
+  (2, 2, 1) × 32 = 128 threads (4 warps)  ← step 4
+  (4, 1, 1) × 32 = 128 threads (4 warps)  ← alternative: all in M
+  (1, 4, 1) × 32 = 128 threads (4 warps)  ← alternative: all in N
+
+Tradeoffs:
+  More atoms in M → better A-data reuse (threads share B-rows)
+  More atoms in N → better B-data reuse (threads share A-rows)
+  More total atoms → more threads → potentially better latency hiding
+    </div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-num">3</div>
+  <div class="phase-content">
+    <h3>Choose Tile Size (BM, BN, BK)</h3>
+    <p>How much work per CTA. The central performance knob:</p>
+    <div class="diagram" style="padding:0.8rem;">
+Constraints:
+  SMEM size: (BM×BK + BN×BK) × sizeof(dtype) × NUM_STAGES ≤ available SMEM
+  Registers: V × (BM/perm_M) × (BN/perm_N) × sizeof(acc) ≤ max registers
+  Divisibility: BM divisible by atom_M × atoms_M, same for BN, BK
+
+Typical choices (Ampere, fp16):
+  128×128×32  (balanced, step 4)
+  128×256×32  (more N, fewer blocks, higher register pressure)
+  256×128×32  (more M, good for tall matrices)
+    </div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-num">4</div>
+  <div class="phase-content">
+    <h3>Choose Permutation (How to Tile Atoms Across the CTA Tile)</h3>
+    <p>Bridge between native atom coverage and full tile:</p>
+    <div class="two-col">
+      <div>
+        <h3 style="color:#f44336;">SIMT (scalar FMA)</h3>
+        <p>Permutation = <strong>Layout</strong></p>
+        <p>Choose R (group size) for coalescing:</p>
+        <pre style="padding:0.5rem;">R = 4 for fp32 (128-bit stores)
+R = 8 for fp16 (128-bit stores)
+permutation_M = (F, R):(R, 1)</pre>
+      </div>
+      <div>
+        <h3 style="color:#76b900;">Tensor Core (mma.sync)</h3>
+        <p>Permutation = <strong>Integer sizes</strong></p>
+        <p>Choose total coverage per iteration:</p>
+        <pre style="padding:0.5rem;">perm_M = atoms_M × atom_M (= native)
+perm_N = atoms_N × atom_N × expand
+perm_K = atoms_K × atom_K
+
+expand ≥ 1 (more = more regs)</pre>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="phase">
+  <div class="phase-num">5</div>
+  <div class="phase-content">
+    <h3>Choose Data Movement Strategy</h3>
+    <p>How data flows: GMEM → SMEM → Registers (steps 2-5 only)</p>
+    <table>
+      <tr><th>Step</th><th>G→S Copy</th><th>S→R Copy</th><th>Pipeline</th></tr>
+      <tr><td>1 (naive)</td><td>N/A (direct GMEM→RMEM)</td><td>N/A</td><td>None</td></tr>
+      <tr><td>2 (smem)</td><td>CopyUniversalOp (sync)</td><td>CopyUniversalOp</td><td>__syncthreads</td></tr>
+      <tr><td>3 (async)</td><td>CopyG2SOp (cp.async)</td><td>CopyUniversalOp</td><td>commit/wait, 3 stages</td></tr>
+      <tr><td>4 (TC)</td><td>CopyG2SOp (cp.async)</td><td>LdMatrix8x8x16bOp</td><td>commit/wait, 3 stages</td></tr>
+      <tr><td>5 (vec)</td><td>CopyG2SOp 128-bit</td><td>LdMatrix + retile</td><td>commit/wait + reg buffer</td></tr>
+    </table>
+  </div>
+</div>
+
+<!-- =================================================================== -->
+<h2>5. How It All Connects (The Full Picture)</h2>
+
+<div class="diagram">
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                                                                             │
+│  <span class="red">HARDWARE</span>              <span class="h2c">PROBLEM</span>              <span class="hl">YOUR CHOICES</span>               │
+│  (can't change)       (given to you)       (engineering decisions)         │
+│                                                                             │
+│  mma.sync.m16n8k16    M=4096               atoms_layout = (2,2,1)         │
+│  TV_layout (fixed)    N=4096               permutation  = (32,32,16)      │
+│  32 threads/atom      K=4096               BM,BN,BK     = 128,128,32     │
+│  4 values/thread      A: (M,K) M-major     NUM_STAGES   = 3              │
+│                       B: (N,K) N-major     Copy atoms: cp.async + ldmatrix│
+│                       C: (M,N) row-major   SMEM swizzle: Swizzle<3,3,3>  │
+│                                                                             │
+│         │                    │                       │                      │
+│         └────────────────────┼───────────────────────┘                      │
+│                              ↓                                              │
+│                    ┌─────────────────────┐                                  │
+│                    │   <span class="warn">CuTe DERIVES:</span>      │                                  │
+│                    │                     │                                  │
+│                    │  NUM_THREADS = 128   │                                  │
+│                    │  Grid = (32, 32, 1)  │                                  │
+│                    │  Regs/thread = 64 f32│                                  │
+│                    │  SMEM = 3×(128+128)  │                                  │
+│                    │       ×32×2 = 48 KB  │                                  │
+│                    │  partition_C shape:   │                                  │
+│                    │    (4,(2,2),(2,2))    │                                  │
+│                    │  K-iters: K/BK = 128 │                                  │
+│                    │  MMA calls/iter: 32  │                                  │
+│                    └─────────────────────┘                                  │
+│                              ↓                                              │
+│                    ┌─────────────────────┐                                  │
+│                    │   <span style="color:#ce93d8;">COMPILED KERNEL</span>    │                                  │
+│                    │   (PTX → GPU)        │                                  │
+│                    └─────────────────────┘                                  │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+</div>
+
+<!-- =================================================================== -->
+<h2>6. The Kernel's 4 Steps — Memory Space Perspective</h2>
+
+<div class="diagram">
+<span class="hl">Step A: TILE</span>              Memory: <span class="red">Global (DRAM, ~400 cycles)</span>
+
+  Input:  mA, mB, mC — full matrices in global memory (ALL CTAs see these)
+  Output: gA, gB, gC — this CTA's tile (views, same memory, different offset)
+
+  What happens: local_tile(mA, tiler, coord=(bidx,bidy), proj)
+  → Pointer arithmetic: base + block_offset
+  → No data movement! Just a narrower view.
+
+─────────────────────────────────────────────────────────────────────────────
+
+<span class="hl">Step B: PARTITION</span>          Memory: <span class="red">Global</span> → <span class="h2c">describes</span> ownership
+
+  Input:  gC (128×128) — this CTA's output tile
+  Output: tCgC (V, M_rest, N_rest) — this THREAD's elements (still in global)
+          tCrC — register accumulator (zeroed)
+
+  What happens: TiledMMA's TV layout + permutation → which elements are mine
+  → No data movement! tCgC is a view. tCrC allocates registers.
+
+─────────────────────────────────────────────────────────────────────────────
+
+<span class="hl">Step C: K-LOOP</span>            Memory: <span class="red">Global</span> → <span class="warn">Shared</span> → <span class="hl">Registers</span>
+
+  The actual data movement and computation:
+
+  ┌────────────────────────────────────────────────────────────────────┐
+  │  for each k_tile:                                                  │
+  │                                                                    │
+  │    <span class="red">G→S</span>: cp.async (DMA hardware copies GMEM → SMEM, async)         │
+  │         128 threads cooperate to fill (BM×BK + BN×BK) of SMEM     │
+  │                                                                    │
+  │    <span class="warn">S→R</span>: ldmatrix (warp-level load, SMEM → registers)              │
+  │         Each thread loads its MMA fragment from swizzled SMEM      │
+  │                                                                    │
+  │    <span class="hl">Compute</span>: cute.gemm → mma.sync (tensor core MMA in registers)   │
+  │         Accumulates: tCrC += tCrA × tCrB                          │
+  │                                                                    │
+  └────────────────────────────────────────────────────────────────────┘
+
+─────────────────────────────────────────────────────────────────────────────
+
+<span class="hl">Step D: EPILOGUE</span>          Memory: <span class="hl">Registers</span> → <span class="red">Global</span>
+
+  Input:  tCrC — accumulated results in registers (64 values per thread)
+  Output: tCgC — written to global memory
+
+  What happens: cute.copy(atom, tCrC, tCgC)
+  → 64 store instructions per thread, targeting the addresses in tCgC's strides.
+</div>
+
+<!-- =================================================================== -->
+<h2>7. Naming Convention Cheat Sheet</h2>
+
+<table>
+<tr><th>Prefix</th><th>Meaning</th><th>Memory</th><th>Scope</th></tr>
+<tr><td><code>m</code></td><td>Full matrix</td><td>Global</td><td>All CTAs</td></tr>
+<tr><td><code>g</code></td><td>CTA-tiled view</td><td>Global</td><td>One CTA</td></tr>
+<tr><td><code>s</code></td><td>Shared memory tensor</td><td>Shared</td><td>One CTA</td></tr>
+<tr><td><code>t_g_</code></td><td>Thread-partitioned, global</td><td>Global</td><td>One thread</td></tr>
+<tr><td><code>t_s_</code></td><td>Thread-partitioned, shared</td><td>Shared</td><td>One thread</td></tr>
+<tr><td><code>t_r_</code></td><td>Thread-partitioned, register</td><td>Registers</td><td>One thread</td></tr>
+</table>
+
+<div class="diagram">
+Full naming: <span class="hl">t C g A</span>
+             │ │ │ │
+             │ │ │ └── which tensor (A, B, or C)
+             │ │ └──── memory space (g=global, s=shared, r=register)
+             │ └────── partitioned FOR which operand (C's M×N pattern, A's M×K, B's N×K)
+             └──────── "t" = thread-partitioned (personal view)
+</div>
+
+<!-- =================================================================== -->
+<h2>8. The Performance Equation (Why These Choices Matter)</h2>
+
+<div class="diagram">
+<span class="hl">Roofline: your kernel is limited by either compute or memory bandwidth.</span>
+
+  Compute throughput:
+    = NUM_THREADS × V × (atom ops per cycle) × SM clock
+    → More atoms, bigger tiles → more compute per CTA
+
+  Memory bandwidth demand:
+    = (BM×BK + BN×BK) × sizeof(dtype) × (K/BK) / time
+    → Bigger BK → fewer loads, better compute/memory ratio
+
+  Arithmetic intensity:
+    = 2×BM×BN×BK / ((BM×BK + BN×BK) × sizeof(dtype))
+    → Bigger tiles → higher intensity → less memory-bound
+
+<span class="hl">Your choices directly control this balance:</span>
+
+  ┌──────────────┬─────────────────────────────────────────────┐
+  │ BM, BN       │ ↑ = more compute per load = higher AI       │
+  │              │ ↑ = more registers = lower occupancy        │
+  ├──────────────┼─────────────────────────────────────────────┤
+  │ BK           │ ↑ = fewer global loads                      │
+  │              │ ↑ = more SMEM per stage                     │
+  ├──────────────┼─────────────────────────────────────────────┤
+  │ NUM_STAGES   │ ↑ = better latency hiding (overlap)         │
+  │              │ ↑ = more SMEM total                         │
+  ├──────────────┼─────────────────────────────────────────────┤
+  │ atoms_layout │ More atoms → more threads → more occupancy  │
+  │              │ But also more register pressure per SM      │
+  ├──────────────┼─────────────────────────────────────────────┤
+  │ permutation  │ Bigger → more work per thread → fewer iters │
+  │              │ But more accumulators → more registers      │
+  └──────────────┴─────────────────────────────────────────────┘
+
+  The art of kernel design = finding the sweet spot in this multi-dimensional space.
+</div>
+
+<!-- =================================================================== -->
+<h2>9. Quick Reference: Step 1 vs Step 4</h2>
+
+<table>
+<tr><th></th><th>Step 1 (Naive SIMT)</th><th>Step 4 (Tensor Core)</th></tr>
+<tr><td>Atom</td><td>MmaUniversalOp(f32) — 1×1×1</td><td>MmaF16BF16Op(f16,f32,(16,8,16))</td></tr>
+<tr><td>atoms_layout</td><td>(16, 16, 1) = 256 atoms</td><td>(2, 2, 1) = 4 atoms</td></tr>
+<tr><td>Threads</td><td>256 × 1 = 256</td><td>4 × 32 = 128</td></tr>
+<tr><td>Tile</td><td>128×128×8</td><td>128×128×32</td></tr>
+<tr><td>Permutation</td><td>(16,4):(4,1) — layout</td><td>(32, 32, 16) — sizes</td></tr>
+<tr><td>Data path</td><td>GMEM→RMEM→FMA→RMEM→GMEM</td><td>GMEM→SMEM→RMEM→HMMA→RMEM→GMEM</td></tr>
+<tr><td>Regs per thread (C)</td><td>64 × f32 = 256 B</td><td>64 × f32 = 256 B</td></tr>
+<tr><td>SMEM</td><td>None</td><td>3×(128+128)×32×2B = 48 KB</td></tr>
+<tr><td>Peak FLOPS</td><td>Low (scalar FMA)</td><td>High (tensor core: 256 ops/cycle/SM)</td></tr>
+</table>
+
+<!-- =================================================================== -->
+<h2>10. The One-Page Summary</h2>
+
+<div class="box green">
+<div class="diagram" style="background:transparent; padding:0;">
+<span class="hl">To design a CuTe GEMM kernel:</span>
+
+  1. <span class="red">Accept</span> what's fixed:   The atom (hardware instruction + TV layout)
+  2. <span class="h2c">Accept</span> what's given:   Problem size, data layouts, data types
+  3. <span class="hl">Choose</span> your knobs:     atoms_layout, permutation, BM/BN/BK, stages, copy atoms
+  4. <span class="dim">Let CuTe derive</span>:      Thread mapping, partition shapes, index math, grid
+
+  <span class="warn">Your job = Step 3. Everything else is handled.</span>
+
+  The kernel code itself is a template:
+    A. Tile (local_tile) → B. Partition → C. K-loop → D. Epilogue
+
+  This structure is THE SAME for all 5 tutorial steps.
+  Only the components plugged in change (atoms, copies, pipeline).
+</div>
+</div>
+
+</body>
+</html>

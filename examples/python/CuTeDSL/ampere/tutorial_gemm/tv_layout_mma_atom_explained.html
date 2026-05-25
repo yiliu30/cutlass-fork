@@ -1,0 +1,609 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TV Layout & MMA Atom Explained</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; background: #1a1a2e; color: #e0e0e0; line-height: 1.7; }
+  h1 { color: #76b900; text-align: center; }
+  h2 { color: #76b900; border-bottom: 2px solid #333; padding-bottom: 0.3rem; margin-top: 2.5rem; }
+  h3 { color: #00bcd4; margin-top: 1.5rem; }
+  pre { background: #0f0f23; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.82rem; line-height: 1.5; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0f0f23; padding: 0.1rem 0.4rem; border-radius: 3px; font-size: 0.9em; }
+  table { border-collapse: collapse; margin: 1rem 0; }
+  table.full { width: 100%; }
+  th, td { padding: 0.5rem 0.6rem; text-align: center; border: 1px solid #333; font-size: 0.85rem; }
+  th { background: #16213e; color: #76b900; }
+  .box { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #333; margin: 1rem 0; }
+  .box.green { border-left: 4px solid #76b900; }
+  .box.blue { border-left: 4px solid #00bcd4; }
+  .box.orange { border-left: 4px solid #ff9800; }
+  .diagram { background: #0f0f23; padding: 1.5rem; border-radius: 8px; font-family: monospace; white-space: pre; overflow-x: auto; font-size: 0.82rem; line-height: 1.4; }
+  .hl { color: #76b900; font-weight: bold; }
+  .h2c { color: #00bcd4; }
+  .warn { color: #ff9800; }
+  .red { color: #f44336; }
+  .analogy { background: #1a2a1a; border: 1px solid #4a4; border-radius: 8px; padding: 1rem; margin: 1rem 0; }
+  .analogy::before { content: "Analogy: "; font-weight: bold; color: #76b900; }
+
+  /* MMA grid colors - one per thread group */
+  .t0  { background: #76b900; color: #000; }  /* T0-T7 */
+  .t8  { background: #00bcd4; color: #000; }  /* T8-T15 */
+  .t16 { background: #ff9800; color: #000; }  /* T16-T23 */
+  .t24 { background: #e91e63; color: #fff; }  /* T24-T31 */
+  .top-half { opacity: 1; }
+  .bot-half { opacity: 0.65; }
+
+  .three-col { display: grid; grid-template-columns: 1fr auto 1fr; gap: 1.5rem; align-items: center; margin: 1.5rem 0; }
+  .arrow-col { font-size: 2rem; color: #76b900; }
+  .comparison { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin: 1.5rem 0; }
+  .panel { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #333; }
+  .panel.cuda { border-left: 4px solid #f44336; }
+  .panel.cute { border-left: 4px solid #76b900; }
+</style>
+</head>
+<body>
+
+<h1>TV Layout & MMA Atom — Demystified</h1>
+
+<!-- =================================================================== -->
+<h2>1. Three Things, One Mapping</h2>
+
+<p>An MMA instruction involves three things:</p>
+
+<div class="three-col">
+  <div class="box blue" style="text-align:center">
+    <h3 style="margin-top:0">Threads</h3>
+    <p>32 threads in a warp<br>(the workers)</p>
+  </div>
+  <div class="arrow-col">&harr;</div>
+  <div class="box orange" style="text-align:center">
+    <h3 style="margin-top:0">Matrix Elements</h3>
+    <p>16&times;8 = 128 output values<br>(the work)</p>
+  </div>
+</div>
+
+<p>Each thread holds some elements in its <strong>registers</strong> (private storage). The <strong>TV Layout</strong> is the map that says:</p>
+
+<div class="box green">
+<p style="font-size:1.2rem; text-align:center; margin:0">
+<strong>TV Layout</strong> = given <code>(thread_id, value_index)</code>, which <code>(row, col)</code> in the matrix?
+</p>
+</div>
+
+<div class="analogy">
+Think of a warehouse with 128 packages (matrix elements) and 32 workers (threads). Each worker carries exactly 4 packages in their backpack (registers). The TV layout is the <strong>assignment sheet</strong> that says "Worker #5, your 4 packages are at shelf positions (0,5), (1,5), (8,5), (9,5)."
+</div>
+
+<!-- =================================================================== -->
+<h2>2. "Fixed by NVIDIA's ISA" — What Does That Mean?</h2>
+
+<div class="box orange">
+<h3 style="margin-top:0">ISA = Instruction Set Architecture = the hardware's rule book</h3>
+<p>When NVIDIA designed the <code>mma.sync.m16n8k16</code> instruction, they <strong>hardwired</strong> which thread gets which output element. It's baked into the chip's silicon. You cannot change it, just like you can't change that <code>1 + 1 = 2</code> on your CPU.</p>
+</div>
+
+<div class="analogy">
+The warehouse manager (NVIDIA) has already assigned the packages to workers. You (the programmer) just got a sheet telling you the assignments. You can't reassign — the conveyor belt is already built that way.
+</div>
+
+<p>Compare the two atom types in our tutorial:</p>
+
+<table class="full">
+<tr>
+  <th>Property</th>
+  <th>Step 1: Scalar FMA</th>
+  <th>Step 4: Tensor Core HMMA</th>
+</tr>
+<tr>
+  <td>PTX instruction</td>
+  <td><code>fma.rn.f32</code></td>
+  <td><code>mma.sync.aligned.m16n8k16.f32.f16</code></td>
+</tr>
+<tr>
+  <td>Output size</td>
+  <td>1&times;1 = 1 element</td>
+  <td>16&times;8 = 128 elements</td>
+</tr>
+<tr>
+  <td>Threads involved</td>
+  <td>1</td>
+  <td>32 (full warp)</td>
+</tr>
+<tr>
+  <td>Values per thread</td>
+  <td>1</td>
+  <td>4</td>
+</tr>
+<tr>
+  <td>TV Layout shape</td>
+  <td><code>(1, 1)</code> — trivial</td>
+  <td><code>(32, 4)</code> — complex, ISA-defined</td>
+</tr>
+<tr>
+  <td>Thread&rarr;element mapping</td>
+  <td>Obvious (1:1)</td>
+  <td>Irregular (NVIDIA decides)</td>
+</tr>
+</table>
+
+<!-- =================================================================== -->
+<h2>3. The Full Mapping: <code>mma.sync.m16n8k16</code> Output</h2>
+
+<p>Here's the <strong>exact</strong> assignment NVIDIA hardwired for the 16&times;8 output matrix C.<br>
+Each cell shows <code>T<em>n</em>:v<em>i</em></code> = thread <em>n</em>, value index <em>i</em>.</p>
+
+<table>
+<tr>
+  <th></th>
+  <th>col 0</th><th>col 1</th><th>col 2</th><th>col 3</th>
+  <th>col 4</th><th>col 5</th><th>col 6</th><th>col 7</th>
+</tr>
+<tr><th>row 0</th>
+  <td class="t0 top-half">T0:v0</td><td class="t0 top-half">T1:v0</td><td class="t0 top-half">T2:v0</td><td class="t0 top-half">T3:v0</td>
+  <td class="t0 top-half">T4:v0</td><td class="t0 top-half">T5:v0</td><td class="t0 top-half">T6:v0</td><td class="t0 top-half">T7:v0</td>
+</tr>
+<tr><th>row 1</th>
+  <td class="t0 top-half">T0:v1</td><td class="t0 top-half">T1:v1</td><td class="t0 top-half">T2:v1</td><td class="t0 top-half">T3:v1</td>
+  <td class="t0 top-half">T4:v1</td><td class="t0 top-half">T5:v1</td><td class="t0 top-half">T6:v1</td><td class="t0 top-half">T7:v1</td>
+</tr>
+<tr><th>row 2</th>
+  <td class="t8 top-half">T8:v0</td><td class="t8 top-half">T9:v0</td><td class="t8 top-half">T10:v0</td><td class="t8 top-half">T11:v0</td>
+  <td class="t8 top-half">T12:v0</td><td class="t8 top-half">T13:v0</td><td class="t8 top-half">T14:v0</td><td class="t8 top-half">T15:v0</td>
+</tr>
+<tr><th>row 3</th>
+  <td class="t8 top-half">T8:v1</td><td class="t8 top-half">T9:v1</td><td class="t8 top-half">T10:v1</td><td class="t8 top-half">T11:v1</td>
+  <td class="t8 top-half">T12:v1</td><td class="t8 top-half">T13:v1</td><td class="t8 top-half">T14:v1</td><td class="t8 top-half">T15:v1</td>
+</tr>
+<tr><th>row 4</th>
+  <td class="t16 top-half">T16:v0</td><td class="t16 top-half">T17:v0</td><td class="t16 top-half">T18:v0</td><td class="t16 top-half">T19:v0</td>
+  <td class="t16 top-half">T20:v0</td><td class="t16 top-half">T21:v0</td><td class="t16 top-half">T22:v0</td><td class="t16 top-half">T23:v0</td>
+</tr>
+<tr><th>row 5</th>
+  <td class="t16 top-half">T16:v1</td><td class="t16 top-half">T17:v1</td><td class="t16 top-half">T18:v1</td><td class="t16 top-half">T19:v1</td>
+  <td class="t16 top-half">T20:v1</td><td class="t16 top-half">T21:v1</td><td class="t16 top-half">T22:v1</td><td class="t16 top-half">T23:v1</td>
+</tr>
+<tr><th>row 6</th>
+  <td class="t24 top-half">T24:v0</td><td class="t24 top-half">T25:v0</td><td class="t24 top-half">T26:v0</td><td class="t24 top-half">T27:v0</td>
+  <td class="t24 top-half">T28:v0</td><td class="t24 top-half">T29:v0</td><td class="t24 top-half">T30:v0</td><td class="t24 top-half">T31:v0</td>
+</tr>
+<tr><th>row 7</th>
+  <td class="t24 top-half">T24:v1</td><td class="t24 top-half">T25:v1</td><td class="t24 top-half">T26:v1</td><td class="t24 top-half">T27:v1</td>
+  <td class="t24 top-half">T28:v1</td><td class="t24 top-half">T29:v1</td><td class="t24 top-half">T30:v1</td><td class="t24 top-half">T31:v1</td>
+</tr>
+<tr><th colspan="9" style="background:#0f0f23; height:4px; border:none;"></th></tr>
+<tr><th>row 8</th>
+  <td class="t0 bot-half">T0:v2</td><td class="t0 bot-half">T1:v2</td><td class="t0 bot-half">T2:v2</td><td class="t0 bot-half">T3:v2</td>
+  <td class="t0 bot-half">T4:v2</td><td class="t0 bot-half">T5:v2</td><td class="t0 bot-half">T6:v2</td><td class="t0 bot-half">T7:v2</td>
+</tr>
+<tr><th>row 9</th>
+  <td class="t0 bot-half">T0:v3</td><td class="t0 bot-half">T1:v3</td><td class="t0 bot-half">T2:v3</td><td class="t0 bot-half">T3:v3</td>
+  <td class="t0 bot-half">T4:v3</td><td class="t0 bot-half">T5:v3</td><td class="t0 bot-half">T6:v3</td><td class="t0 bot-half">T7:v3</td>
+</tr>
+<tr><th>row 10</th>
+  <td class="t8 bot-half">T8:v2</td><td class="t8 bot-half">T9:v2</td><td class="t8 bot-half">T10:v2</td><td class="t8 bot-half">T11:v2</td>
+  <td class="t8 bot-half">T12:v2</td><td class="t8 bot-half">T13:v2</td><td class="t8 bot-half">T14:v2</td><td class="t8 bot-half">T15:v2</td>
+</tr>
+<tr><th>row 11</th>
+  <td class="t8 bot-half">T8:v3</td><td class="t8 bot-half">T9:v3</td><td class="t8 bot-half">T10:v3</td><td class="t8 bot-half">T11:v3</td>
+  <td class="t8 bot-half">T12:v3</td><td class="t8 bot-half">T13:v3</td><td class="t8 bot-half">T14:v3</td><td class="t8 bot-half">T15:v3</td>
+</tr>
+<tr><th>row 12</th>
+  <td class="t16 bot-half">T16:v2</td><td class="t16 bot-half">T17:v2</td><td class="t16 bot-half">T18:v2</td><td class="t16 bot-half">T19:v2</td>
+  <td class="t16 bot-half">T20:v2</td><td class="t16 bot-half">T21:v2</td><td class="t16 bot-half">T22:v2</td><td class="t16 bot-half">T23:v2</td>
+</tr>
+<tr><th>row 13</th>
+  <td class="t16 bot-half">T16:v3</td><td class="t16 bot-half">T17:v3</td><td class="t16 bot-half">T18:v3</td><td class="t16 bot-half">T19:v3</td>
+  <td class="t16 bot-half">T20:v3</td><td class="t16 bot-half">T21:v3</td><td class="t16 bot-half">T22:v3</td><td class="t16 bot-half">T23:v3</td>
+</tr>
+<tr><th>row 14</th>
+  <td class="t24 bot-half">T24:v2</td><td class="t24 bot-half">T25:v2</td><td class="t24 bot-half">T26:v2</td><td class="t24 bot-half">T27:v2</td>
+  <td class="t24 bot-half">T28:v2</td><td class="t24 bot-half">T29:v2</td><td class="t24 bot-half">T30:v2</td><td class="t24 bot-half">T31:v2</td>
+</tr>
+<tr><th>row 15</th>
+  <td class="t24 bot-half">T24:v3</td><td class="t24 bot-half">T25:v3</td><td class="t24 bot-half">T26:v3</td><td class="t24 bot-half">T27:v3</td>
+  <td class="t24 bot-half">T28:v3</td><td class="t24 bot-half">T29:v3</td><td class="t24 bot-half">T30:v3</td><td class="t24 bot-half">T31:v3</td>
+</tr>
+</table>
+
+<p>Color key: <span class="t0" style="padding: 0.2rem 0.5rem; border-radius: 3px;">T0-T7</span>
+<span class="t8" style="padding: 0.2rem 0.5rem; border-radius: 3px;">T8-T15</span>
+<span class="t16" style="padding: 0.2rem 0.5rem; border-radius: 3px;">T16-T23</span>
+<span class="t24" style="padding: 0.2rem 0.5rem; border-radius: 3px;">T24-T31</span>
+&nbsp; Bright = v0,v1 (rows 0-7) &nbsp; Dim = v2,v3 (rows 8-15)</p>
+
+<!-- =================================================================== -->
+<h2>4. Zoom In: Thread 0's Four Elements</h2>
+
+<div class="diagram">
+Thread 0 owns 4 values in its registers after the MMA executes:
+
+  Register    Matrix Position    Why these specific cells?
+  ────────    ─────────────────  ─────────────────────────
+  v0    &rarr;     C[ 0, 0]          NVIDIA's hardware wiring
+  v1    &rarr;     C[ 1, 0]          decided this pattern.
+  v2    &rarr;     C[ 8, 0]          You can't change it.
+  v3    &rarr;     C[ 9, 0]          It's in the silicon.
+
+Visually in the 16&times;8 matrix:
+
+         col 0
+row  0:  <span class="hl">[v0]</span> ← pair 1
+row  1:  <span class="hl">[v1]</span> ←
+row  2:   .
+  ...     .      (other threads' elements)
+row  7:   .
+row  8:  <span class="hl">[v2]</span> ← pair 2 (8 rows below pair 1)
+row  9:  <span class="hl">[v3]</span> ←
+  ...     .
+row 15:   .
+</div>
+
+<div class="box blue">
+<h3 style="margin-top:0">Pattern for ALL threads (read from the table above):</h3>
+<ul>
+  <li><strong>Column</strong> = <code>thread_id % 8</code> &nbsp; (threads 0-7 own columns 0-7)</li>
+  <li><strong>Row group</strong> = <code>(thread_id / 8) * 2</code> &nbsp; (threads 0-7 on rows 0-1, threads 8-15 on rows 2-3, etc.)</li>
+  <li><strong>v0,v1</strong> in top half (rows 0-7), &nbsp; <strong>v2,v3</strong> in bottom half (rows 8-15), same column</li>
+  <li>Each thread always has <strong>2 pairs of 2 adjacent rows</strong>, 8 rows apart</li>
+</ul>
+</div>
+
+<!-- =================================================================== -->
+<h2>5. The TV Layout IS This Table (as Math)</h2>
+
+<p>CuTe doesn't store the table — it encodes it as a <strong>layout function</strong> with <strong>fixed strides</strong>:</p>
+
+<div class="diagram">
+<span class="hl">The exact TV_layout_C for mma.sync.m16n8k16 (accumulator D/C):</span>
+
+  Shape:  ( (4, 8),  (2, 2) )
+  Stride: ( (16, 1), (8, 64) )
+            ─┬────    ─┬────
+             T          V
+          (threads)  (values)
+
+Both T and V are <span class="warn">hierarchical</span> (nested tuples):
+
+  T = (4, 8) means: thread_id is decomposed as (T_outer, T_inner)
+       T_inner = tid % 8    (which column, 0-7)
+       T_outer = tid / 8    (which row-group, 0-3)
+
+  V = (2, 2) means: value_index is decomposed as (V_inner, V_outer)
+       V_inner = vid % 2    (which row within a pair)
+       V_outer = vid / 2    (which half: top or bottom)
+</div>
+
+<h3>How the strides map to (row, col) in the 16&times;8 matrix</h3>
+
+<div class="diagram">
+The 16&times;8 matrix is stored in row-major as a flat array: offset = row * 8 + col
+
+Now trace each stride:
+
+  <span class="h2c">T_inner</span> stride = <span class="hl">1</span>
+    tid % 8 contributes offset += (tid%8) * 1
+    &rarr; this IS the column!  (col = tid % 8)
+
+  <span class="h2c">T_outer</span> stride = <span class="hl">16</span>
+    tid / 8 contributes offset += (tid/8) * 16
+    16 in row-major(8 cols) = 2 rows  &rarr; row += (tid/8) * 2
+
+  <span class="warn">V_inner</span> stride = <span class="hl">8</span>
+    vid % 2 contributes offset += (vid%2) * 8
+    8 in row-major(8 cols) = 1 row   &rarr; row += (vid%2) * 1
+
+  <span class="warn">V_outer</span> stride = <span class="hl">64</span>
+    vid / 2 contributes offset += (vid/2) * 64
+    64 in row-major(8 cols) = 8 rows &rarr; row += (vid/2) * 8
+</div>
+
+<h3>Putting it together</h3>
+
+<div class="diagram">
+<span class="hl">Formula (derived from shape + stride):</span>
+
+  offset(tid, vid) = (tid%8)*1 + (tid/8)*16 + (vid%2)*8 + (vid/2)*64
+
+  Converting to (row, col) in the 16&times;8 matrix:
+    col = tid % 8
+    row = (tid / 8) * 2  +  (vid % 2)  +  (vid / 2) * 8
+
+<span class="hl">Verification:</span>
+
+  (tid=0,  vid=0): col=0, row= 0*2 + 0 + 0*8 =  0  &rarr; C[ 0, 0] <span class="hl">&checkmark;</span>
+  (tid=0,  vid=1): col=0, row= 0*2 + 1 + 0*8 =  1  &rarr; C[ 1, 0] <span class="hl">&checkmark;</span>
+  (tid=0,  vid=2): col=0, row= 0*2 + 0 + 1*8 =  8  &rarr; C[ 8, 0] <span class="hl">&checkmark;</span>
+  (tid=0,  vid=3): col=0, row= 0*2 + 1 + 1*8 =  9  &rarr; C[ 9, 0] <span class="hl">&checkmark;</span>
+  (tid=5,  vid=1): col=5, row= 0*2 + 1 + 0*8 =  1  &rarr; C[ 1, 5] <span class="hl">&checkmark;</span>
+  (tid=8,  vid=0): col=0, row= 1*2 + 0 + 0*8 =  2  &rarr; C[ 2, 0] <span class="hl">&checkmark;</span>
+  (tid=24, vid=2): col=0, row= 3*2 + 0 + 1*8 = 14  &rarr; C[14, 0] <span class="hl">&checkmark;</span>
+  (tid=31, vid=3): col=7, row= 3*2 + 1 + 1*8 = 15  &rarr; C[15, 7] <span class="hl">&checkmark;</span>
+</div>
+
+<div class="box green">
+<h3 style="margin-top:0">Key Insight: The Strides ARE the Hardware Wiring</h3>
+<p>The four numbers <code>(16, 1, 8, 64)</code> are permanently fixed for <code>mma.sync.m16n8k16</code>. They encode exactly how NVIDIA's tensor core routes data to thread registers. A different instruction (e.g., <code>mma.sync.m16n8k8</code> or <code>wgmma.m64n256k16</code>) would have <strong>different fixed strides</strong>.</p>
+</div>
+
+<h3>Why hierarchical? Why not just (32, 4)?</h3>
+
+<div class="diagram">
+If the mapping were simply "stride s_t per thread, stride s_v per value":
+
+  offset = tid * s_t + vid * s_v
+
+Then threads and values would need to be evenly spaced — but they're NOT:
+  Thread 0 &rarr; col 0    (offset 0)
+  Thread 1 &rarr; col 1    (offset 1)
+  ...
+  Thread 7 &rarr; col 7    (offset 7)
+  Thread 8 &rarr; row 2    (offset 16)  &larr; NOT offset 8!
+
+A single flat stride can't express this jump. The <span class="hl">hierarchical</span> shape (4, 8)
+lets CuTe encode the two different stride patterns:
+  - within a group of 8: stride 1 (columns)
+  - between groups: stride 16 (skip 2 rows)
+</div>
+
+<div class="analogy">
+The TV layout is like a <strong>formula version of the lookup table</strong>. Instead of storing all 128 entries, it uses 4 numbers (the strides 16, 1, 8, 64) that can compute any entry on the fly. CuTe's hierarchical layout makes this possible because the pattern, while irregular-looking, is built from regular sub-patterns.
+</div>
+
+<!-- =================================================================== -->
+<h2>6. Why CuTe Encodes This (The Payoff)</h2>
+
+<div class="comparison">
+<div class="panel cuda">
+<h3 style="margin-top:0">Without CuTe (Raw CUDA)</h3>
+<pre><code>// After mma.sync, results are in
+// registers d0, d1, d2, d3.
+// You must KNOW the mapping to store:
+int lane = threadIdx.x % 32;
+int col = lane % 8;
+int row_base = (lane / 8) * 2;
+
+// Store pair 1 (top half)
+C[(row_base + 0) * N + col] = d0;
+C[(row_base + 1) * N + col] = d1;
+// Store pair 2 (bottom half, +8)
+C[(row_base + 8) * N + col] = d2;
+C[(row_base + 9) * N + col] = d3;
+
+// Change to mma.m16n8k8?
+// ALL index math must be rewritten!
+// Change to wmma.m16n16k16?
+// Completely different layout!</code></pre>
+</div>
+
+<div class="panel cute">
+<h3 style="margin-top:0">With CuTe</h3>
+<pre><code># The atom KNOWS the mapping
+atom = MmaF16BF16Op(f16, f32, (16,8,16))
+
+# partition_C uses the atom's TV layout
+thr_mma = tiled_mma.get_slice(tidx)
+tCgC = thr_mma.partition_C(gC)
+
+# Copy results to global memory
+cute.copy(copy_atom, tCrC, tCgC)
+# ^^^ correct for ANY atom!
+
+# Change to a different MMA?
+# Just swap the atom.
+# partition_C and copy auto-adapt.
+# Zero index math to update.</code></pre>
+</div>
+</div>
+
+<!-- =================================================================== -->
+<h2>7. Summary: The Three Layers (Annotated)</h2>
+
+<div class="diagram">
+┌────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                │
+│  <span class="red">Layer 1: Hardware (NVIDIA ISA)</span>  ────────────────────── <span class="red">🔒 FIXED BY HARDWARE</span>  │
+│                                                                                │
+│    "mma.sync.m16n8k16 gives thread 0 elements at (0,0),(1,0),(8,0),(9,0)"      │
+│    Fixed. Can't change. Different per instruction.                             │
+│                                                                                │
+│    What's fixed:                                                               │
+│      &bull; Atom shape (16, 8, 16) in MNK                                          │
+│      &bull; Threads per atom (32 = 1 warp)                                          │
+│      &bull; Values per thread (4)                                                   │
+│      &bull; TV_layout strides (16, 1, 8, 64) — the wiring                           │
+│      &bull; Input data format (fp16) and accumulator format (fp32)                   │
+│                                                                                │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  <span class="warn">Layer 2: Atom (CuTe encoding)</span>  ────────────────────── <span class="warn">🔒 FIXED (wrapper)</span>     │
+│                                                                                │
+│    TV_layout_C = ((4,8), (2,2)) : ((16,1), (8,64))                             │
+│    Just a CuTe-readable encoding of the hardware truth.                        │
+│    No user choice here — one-to-one mapping from Layer 1.                      │
+│                                                                                │
+│    What's fixed:                                                               │
+│      &bull; Everything from Layer 1, written as CuTe Layout objects                 │
+│      &bull; TV_layout_A, TV_layout_B, TV_layout_C — all defined by ISA              │
+│                                                                                │
+├────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                │
+│  <span class="hl">Layer 3: TiledMMA (user-level)</span>  ──────────────── <span class="hl">🎨 USER DESIGN CHOICES</span>     │
+│                                                                                │
+│    This is where YOUR workload meets the hardware.                             │
+│    You choose how to tile the atom across your CTA tile.                       │
+│                                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │  <span class="h2c">Inputs from your problem (not free choices):</span>                          │  │
+│  │                                                                          │  │
+│  │    &bull; CTA tile size (BM=128, BN=128, BK=32) ← tuning knob,              │  │
+│  │      but constrained by SMEM size, register budget, occupancy            │  │
+│  │    &bull; Total threads per block (128) ← must match atoms_layout &times; 32     │  │
+│  │    &bull; Problem size (M, N, K) ← given by the user's matrix dims           │  │
+│  │    &bull; Data layout of A, B, C in memory ← given by caller                 │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │  <span class="hl">Your free design parameters:</span>                                          │  │
+│  │                                                                          │  │
+│  │    1. <span class="hl">atoms_layout</span> = (2, 2, 1)                                          │  │
+│  │       "How many atoms, arranged how?"                                    │  │
+│  │       → 2 in M, 2 in N, 1 in K = 4 atoms = 4 warps = 128 threads       │  │
+│  │                                                                          │  │
+│  │       Coverage per step (atoms_layout × atom_shape):                     │  │
+│  │         M: 2 atoms × 16 rows/atom  = <span class="hl">32 rows</span>                            │  │
+│  │         N: 2 atoms ×  8 cols/atom  = <span class="hl">16 cols</span>                            │  │
+│  │         K: 1 atom  × 16 depth/atom = 16 reduction                       │  │
+│  │         ───────────────────────────────────────                          │  │
+│  │         One step covers: 32 × 16 = 512 output elements                  │  │
+│  │         (but need 128×128 = 16384 total, so we iterate)                  │  │
+│  │                                                                          │  │
+│  │       Tradeoff: more atoms = more parallelism but more threads           │  │
+│  │                 fewer atoms = fewer threads but more work per thread      │  │
+│  │                                                                          │  │
+│  │    2. <span class="hl">permutation</span> = (32, 32, 16)                                       │  │
+│  │       "How much total coverage per thread across all iterations?"        │  │
+│  │       → permutation_M = 32, permutation_N = 32, permutation_K = 16      │  │
+│  │                                                                          │  │
+│  │       These must be ≥ atoms_layout × atom_shape:                         │  │
+│  │         M: permutation_M(32) = atoms(2) × atom_M(16) = 32  ✓ exact      │  │
+│  │         N: permutation_N(32) = atoms(2) × atom_N(8) × <span class="warn">2</span> = 32           │  │
+│  │            ↑ the ×2 means each atom "visits" 2 N-positions               │  │
+│  │                                                                          │  │
+│  │       Iterations to cover the full CTA tile:                             │  │
+│  │         M: BM / permutation_M = 128 / 32 = <span class="hl">4 iterations in M</span>            │  │
+│  │         N: BN / permutation_N = 128 / 32 = <span class="hl">4 iterations in N</span>            │  │
+│  │         Total: 4 × 4 = <span class="hl">16 iterations</span> to cover full 128×128             │  │
+│  │                                                                          │  │
+│  │       Tradeoff: larger permutation = more elements per thread            │  │
+│  │                 = more registers = potentially lower occupancy           │  │
+│  │                                                                          │  │
+│  │    3. <span class="hl">BK (tile depth)</span> = 32                                              │  │
+│  │       "How much K-reduction per SMEM load?"                              │  │
+│  │       → BK / atom_K = 32 / 16 = 2 MMA calls per K-tile                  │  │
+│  │       → Total K iterations: K / BK (outer loop over K)                   │  │
+│  │                                                                          │  │
+│  │       Tradeoff: larger BK = fewer SMEM loads but more SMEM used          │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                │
+│  ┌──────────────────────────────────────────────────────────────────────────┐  │
+│  │  <span class="h2c">Derived automatically (you don't compute these):</span>                     │  │
+│  │                                                                          │  │
+│  │    &bull; Thread→element mapping for all threads (from atom TV + tiling)      │  │
+│  │    &bull; partition_C/A/B output shapes and strides                           │  │
+│  │    &bull; Grid dimensions = ceil(M/BM) × ceil(N/BN)                          │  │
+│  │    &bull; Number of K-iterations = K / BK                                    │  │
+│  │    &bull; Registers per thread = V × M_rest × N_rest (from partition_C)      │  │
+│  └──────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                │
+└────────────────────────────────────────────────────────────────────────────────┘
+</div>
+
+<!-- =================================================================== -->
+<h2>8. Design Decision Map</h2>
+
+<table class="full">
+<tr>
+  <th>Parameter</th>
+  <th>Source</th>
+  <th>Who decides?</th>
+  <th>Can you change it?</th>
+</tr>
+<tr>
+  <td><code>mma.sync.m16n8k16</code></td>
+  <td>NVIDIA hardware</td>
+  <td style="color:#f44336;">NVIDIA (silicon)</td>
+  <td>No. Pick a different instruction if you want different.</td>
+</tr>
+<tr>
+  <td>TV_layout strides <code>(16,1,8,64)</code></td>
+  <td>ISA specification</td>
+  <td style="color:#f44336;">NVIDIA (ISA doc)</td>
+  <td>No. It's how the tensor core routes data.</td>
+</tr>
+<tr>
+  <td>Atom shape <code>(16, 8, 16)</code></td>
+  <td>Instruction definition</td>
+  <td style="color:#f44336;">NVIDIA (fixed)</td>
+  <td>No. Choose a different MMA for different shape.</td>
+</tr>
+<tr>
+  <td>Threads per atom <code>32</code></td>
+  <td>Instruction definition</td>
+  <td style="color:#f44336;">NVIDIA (fixed)</td>
+  <td>No. It's always 1 warp for mma.sync.</td>
+</tr>
+<tr style="background:#1a3a1a;">
+  <td><code>atoms_layout = (2,2,1)</code></td>
+  <td>Kernel design</td>
+  <td style="color:#76b900;">YOU (kernel author)</td>
+  <td>Yes! Could be (1,1,1), (2,4,1), (4,2,1)...</td>
+</tr>
+<tr style="background:#1a3a1a;">
+  <td><code>permutation = (32,32,16)</code></td>
+  <td>Kernel design</td>
+  <td style="color:#76b900;">YOU (kernel author)</td>
+  <td>Yes! Controls coverage and element layout.</td>
+</tr>
+<tr style="background:#1a3a1a;">
+  <td><code>BM, BN, BK = 128,128,32</code></td>
+  <td>Kernel design</td>
+  <td style="color:#76b900;">YOU (kernel author)</td>
+  <td>Yes! Must be multiples of atom dims. Tuning knobs.</td>
+</tr>
+<tr style="background:#1a3a1a;">
+  <td><code>NUM_THREADS = 128</code></td>
+  <td>Kernel design</td>
+  <td style="color:#76b900;">YOU (constrained)</td>
+  <td>= atoms_layout product × 32. Follows from atoms_layout.</td>
+</tr>
+<tr>
+  <td>Problem size <code>(M, N, K)</code></td>
+  <td>Workload</td>
+  <td style="color:#00bcd4;">User/application</td>
+  <td>Given to you. Must be divisible by tile (or add predication).</td>
+</tr>
+<tr>
+  <td>Data layouts <code>(M,K):(1,M)</code></td>
+  <td>Input format</td>
+  <td style="color:#00bcd4;">User/application</td>
+  <td>Given to you. Affects copy atom choice.</td>
+</tr>
+<tr>
+  <td><code>partition_C</code> output shape</td>
+  <td>Derived</td>
+  <td style="color:#888;">Auto (CuTe)</td>
+  <td>You don't choose this — it falls out of the above.</td>
+</tr>
+<tr>
+  <td>Grid dimensions</td>
+  <td>Derived</td>
+  <td style="color:#888;">Auto (CuTe)</td>
+  <td>= ceil(M/BM) × ceil(N/BN). Determined by tile + problem.</td>
+</tr>
+<tr>
+  <td>Registers per thread</td>
+  <td>Derived</td>
+  <td style="color:#888;">Auto (CuTe)</td>
+  <td>Consequence of your choices above. Check occupancy!</td>
+</tr>
+</table>
+
+<div class="box green">
+<h3 style="margin-top:0">The Mental Model at Layer 3</h3>
+<p>You're solving a <strong>tiling puzzle</strong>: given a fixed-size stamp (the atom) and a big rectangle (your CTA tile), decide:</p>
+<ol>
+  <li>How many stamps to use simultaneously → <code>atoms_layout</code></li>
+  <li>How to iterate the stamps across the rectangle → <code>permutation</code></li>
+  <li>How deep to go in K before switching tiles → <code>BK</code></li>
+</ol>
+<p>The constraints are: shared memory capacity (limits BM×BK + BN×BK), register file (limits elements per thread), and occupancy (limits threads per SM). Your job is finding the sweet spot.</p>
+</div>
+
+<div class="box blue">
+<h3 style="margin-top:0">One-sentence summary:</h3>
+<p style="font-size:1.1rem">The TV layout is CuTe's encoding of <strong>NVIDIA's hardware-mandated thread&rarr;element assignment</strong>, turning an opaque ISA rule into composable layout algebra that makes <code>partition_C</code> work automatically for any MMA instruction.</p>
+</div>
+
+</body>
+</html>

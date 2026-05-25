@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Step 1 Thread Trace — CuTe DSL GEMM</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 2rem auto; max-width: 1100px; background: #1a1a2e; color: #e0e0e0; line-height: 1.7; }
+  h1 { color: #76b900; text-align: center; }
+  h2 { color: #76b900; border-bottom: 2px solid #333; padding-bottom: 0.3rem; margin-top: 2.5rem; }
+  h3 { color: #00bcd4; margin-top: 1.5rem; }
+  .subtitle { text-align: center; color: #aaa; margin-bottom: 2rem; }
+  pre { background: #0f0f23; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; line-height: 1.5; font-family: 'JetBrains Mono', 'Fira Code', monospace; }
+  code { font-family: 'JetBrains Mono', 'Fira Code', monospace; background: #0f0f23; padding: 0.1rem 0.4rem; border-radius: 3px; }
+  table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+  th, td { padding: 0.6rem 0.8rem; text-align: left; border: 1px solid #333; }
+  th { background: #16213e; color: #76b900; }
+  tr:nth-child(even) { background: #1a1a3e; }
+  .box { background: #16213e; border-radius: 8px; padding: 1.2rem; border: 1px solid #333; margin: 1rem 0; }
+  .box.green { border-left: 4px solid #76b900; }
+  .box.blue { border-left: 4px solid #00bcd4; }
+  .box.orange { border-left: 4px solid #ff9800; }
+  .box.red { border-left: 4px solid #f44336; }
+  .grid-visual { display: grid; grid-template-columns: repeat(16, 1fr); gap: 2px; margin: 1rem 0; max-width: 500px; }
+  .cell { width: 100%; aspect-ratio: 1; border-radius: 2px; background: #333; }
+  .cell.active { background: #76b900; }
+  .diagram { background: #0f0f23; padding: 1.5rem; border-radius: 8px; font-family: monospace; white-space: pre; overflow-x: auto; font-size: 0.85rem; line-height: 1.4; }
+  .highlight { color: #76b900; font-weight: bold; }
+  .dim { color: #666; }
+  .label { display: inline-block; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; font-weight: bold; margin-right: 0.5rem; }
+  .label-m { background: #1a3a5e; color: #64b5f6; }
+  .label-n { background: #3a1a3a; color: #ce93d8; }
+  .label-k { background: #1a3a1a; color: #81c784; }
+  .step-header { display: flex; align-items: center; gap: 0.5rem; }
+  .step-num { background: #76b900; color: #000; width: 2rem; height: 2rem; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-weight: bold; flex-shrink: 0; }
+</style>
+</head>
+<body>
+
+<h1>Step 1: Thread Trace Deep Dive</h1>
+<p class="subtitle">Tracing Thread 0, Block (0,0) through the naive GEMM kernel<br>
+Problem: M=256, N=128, K=32 | Tile: 128&times;128&times;8 | 256 threads</p>
+
+<!-- =================================================================== -->
+<h2>What is a CTA? What is a CTA Tile?</h2>
+
+<div class="box green">
+<h3 style="margin-top:0">CTA (Cooperative Thread Array) = CUDA Thread Block</h3>
+<p>A group of threads (here 256) that:</p>
+<ul>
+  <li>Execute on the same SM (Streaming Multiprocessor)</li>
+  <li>Share the same shared memory (48KB~164KB)</li>
+  <li>Can synchronize with <code>__syncthreads()</code></li>
+  <li>Are scheduled together as a unit</li>
+</ul>
+<p><strong>In this example:</strong> 1 CTA = 256 threads, assigned to compute one 128&times;128 chunk of C.</p>
+</div>
+
+<div class="box blue">
+<h3 style="margin-top:0">CTA Tile = The Work Assigned to One CTA</h3>
+<p>The <code>cta_tiler = (128, 128, 8)</code> defines how the problem is sliced:</p>
+<ul>
+  <li><span class="label label-m">M=128</span> rows of the output per CTA</li>
+  <li><span class="label label-n">N=128</span> columns of the output per CTA</li>
+  <li><span class="label label-k">K=8</span> reduction elements processed per iteration</li>
+</ul>
+</div>
+
+<div class="diagram">
+Full C matrix (256&times;128):                    Grid = (2, 1) = 2 CTAs total
+
+    N=128 columns
+    &larr;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&mdash;&rarr;
+  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;
+  &boxv;                        &boxv;  &larr; CTA (0,0): rows 0-127, cols 0-127
+  &boxv;   128&times;128 tile         &boxv;     128&times;128 = 16384 elements
+  &boxv;   = CTA (0,0)           &boxv;     256 threads &rarr; 64 elements/thread
+  &boxv;                        &boxv;
+  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;
+  &boxv;                        &boxv;  &larr; CTA (1,0): rows 128-255, cols 0-127
+  &boxv;   128&times;128 tile         &boxv;
+  &boxv;   = CTA (1,0)           &boxv;
+  &boxv;                        &boxv;
+  &boxdr;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxh;&boxdl;
+</div>
+
+<!-- =================================================================== -->
+<h2>Step A: <code>local_tile</code> &mdash; Extract This CTA's Data</h2>
+
+<div class="box orange">
+<h3 style="margin-top:0">How <code>local_tile</code> works (3 operations in one call)</h3>
+<ol>
+  <li><strong>proj</strong> &mdash; filter the 3D tiler to match the tensor's dimensions</li>
+  <li><strong>tile</strong> &mdash; logically divide the tensor into tiles</li>
+  <li><strong>coord</strong> &mdash; select which tile(s) to keep</li>
+</ol>
+</div>
+
+<h3>Tiling A: <code>local_tile(mA, (128,128,8), coord=(0,0,None), proj=(1,None,1))</code></h3>
+
+<div class="diagram">
+mA: shape (256, 32), stride (1, 256)     &larr; M-major: consecutive in M, stride-256 in K
+                                             (A[m,k] at address: base + m + k*256)
+
+<span class="highlight">proj = (1, None, 1)</span>      "A has M and K, not N"
+  tiler (128, 128, 8) &rarr; keep M=128, drop N, keep K=8 &rarr; effective tiler = (128, 8)
+
+<span class="highlight">Tile (256,32) by (128,8):</span>
+  M: 256/128 = 2 tiles     K: 32/8 = 4 tiles
+  Logical shape: (128, 8, <span class="dim">2_M_tiles</span>, <span class="dim">4_K_tiles</span>)
+
+<span class="highlight">coord = (bidx=0, _, None):</span>
+  M-tile index = 0 (first 128 rows)
+  K-tile index = None (keep all 4 as iteration dimension)
+
+<span class="highlight">Result:</span> gA shape <span class="highlight">(128, 8, 4)</span>, stride (1, 256, 2048)
+                    &uarr;   &uarr;  &uarr;
+                    BM  BK  num_k_tiles
+</div>
+
+<h3>Tiling C: <code>local_tile(mC, (128,128,8), coord=(0,0,None), proj=(1,1,None))</code></h3>
+
+<div class="diagram">
+mC: shape (256, 128), stride (128, 1)    &larr; row-major: C[m,n] at address: base + m*128 + n
+
+<span class="highlight">proj = (1, 1, None)</span>    "C has M and N, not K"
+  tiler (128, 128, 8) &rarr; keep M=128, keep N=128, drop K &rarr; effective tiler = (128, 128)
+
+<span class="highlight">Tile (256,128) by (128,128):</span>
+  M: 256/128 = 2 tiles     N: 128/128 = 1 tile
+
+<span class="highlight">coord = (bidx=0, bidy=0, _):</span>
+  Select M-tile 0, N-tile 0
+
+<span class="highlight">Result:</span> gC shape <span class="highlight">(128, 128)</span>, stride (128, 1)
+                    &uarr;    &uarr;
+                    BM   BN
+</div>
+
+<!-- =================================================================== -->
+<h2>Step B: <code>partition_C</code> &mdash; Thread 0's 64 Output Elements</h2>
+
+<h3>How 256 threads map to the 128&times;128 tile</h3>
+
+<div class="diagram">
+atoms_layout = (16, 16, 1):(16, 1, 0)
+
+  Thread ID &rarr; atom position:
+    thr_idx = M_atom * 16 + N_atom     (from stride (16, 1))
+    Thread  0: M_atom=0,  N_atom=0
+    Thread  1: M_atom=0,  N_atom=1
+    Thread 16: M_atom=1,  N_atom=0
+    Thread 255: M_atom=15, N_atom=15
+
+  16 atoms in M cover 128 rows:  128/16 = 8 rows per atom
+  16 atoms in N cover 128 cols:  128/16 = 8 cols per atom
+  Each thread: 8 &times; 8 = 64 elements &checkmark;
+</div>
+
+<h3>The Permutation Reshapes the 8 Elements</h3>
+
+<div class="diagram">
+permutation_M = (16, 4):(4, 1)
+
+  Without permutation: thread 0's 8 M-elements = rows 0,1,2,3,4,5,6,7 (consecutive)
+
+  With permutation (16,4):(4,1):
+    Group 1: 4 consecutive rows starting at offset 0   &rarr; rows 0, 1, 2, 3
+    Group 2: 4 consecutive rows starting at offset 64  &rarr; rows 64, 65, 66, 67
+                                                        (stride 8192 / 128 = 64 rows gap)
+
+  Why? Grouping in 4s = potential 128-bit (4&times;f32) vectorized stores
+</div>
+
+<h3>Thread 0's C Elements Visualized</h3>
+
+<div class="diagram">
+gC tile (128&times;128), Thread 0 owns <span class="highlight">&#9632;</span> elements:
+
+          Col: 0  1  2  3  ...  64 65 66 67  ...  127
+              &darr;  &darr;  &darr;  &darr;       &darr;  &darr;  &darr;  &darr;
+Row   0:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>            &larr; 8 elements
+Row   1:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>
+Row   2:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>
+Row   3:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>            &larr; 32 elements
+Row   4-63:   <span class="dim">(other threads)</span>
+Row  64:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>
+Row  65:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>
+Row  66:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>
+Row  67:      <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>       <span class="highlight">&#9632;  &#9632;  &#9632;  &#9632;</span>            &larr; 64 total &checkmark;
+Row  68-127:  <span class="dim">(other threads)</span>
+
+  = 4 blocks of 4&times;4, arranged as 2 M-groups &times; 2 N-groups
+</div>
+
+<h3>The Output Tensor Shape Explained</h3>
+
+<div class="diagram">
+tCgC: shape (1, (4,2), (4,2)), stride (0, (128, 8192), (1, 64))
+             &uarr;    &uarr;       &uarr;
+             V    M       N
+
+<span class="highlight">V = 1</span>
+  Values per atom invocation. Scalar FMA produces 1 output.
+
+<span class="highlight">M = (4, 2)</span>
+  4 = consecutive rows in each group (rows 0-3, then 64-67)
+  2 = number of groups
+
+  Strides (128, 8192):
+    128  = row stride in C (next row = +128 in memory, since C is 128-wide)
+    8192 = gap between groups = 64 rows &times; 128 = 8192
+
+<span class="highlight">N = (4, 2)</span>
+  4 = consecutive cols in each group (cols 0-3, then 64-67)
+  2 = number of groups
+
+  Strides (1, 64):
+    1  = adjacent column
+    64 = gap between groups = 64 columns apart
+</div>
+
+<!-- =================================================================== -->
+<h2>Step C: K-Loop &mdash; Thread 0 Loads A and B</h2>
+
+<h3>Iteration Structure</h3>
+
+<div class="diagram">
+K = 32,  BK = 8  &rarr;  4 outer k_tiles
+Within each k_tile: 8 k_blocks (one per K-element, since atom is 1&times;1&times;1)
+
+for k_tile in range(4):          &larr; outer loop: 4 iterations
+    load A[:,k_tile], B[:,k_tile] from global memory to registers
+    for k_block in range(8):     &larr; inner loop: 8 FMAs per element pair
+        cute.gemm(...)           &larr; 64 FMAs per k_block (8M &times; 8N accumulations)
+
+Total FMAs: 4 &times; 8 &times; 64 = 2048 = 64 outputs &times; 32 K-reductions &checkmark;
+</div>
+
+<h3><code>partition_A</code> for Thread 0, k_tile=0</h3>
+
+<div class="diagram">
+gA[:, :, 0] &rarr; shape (128, 8), stride (1, 256)   &larr; first 8 columns of A for this CTA
+
+tCgA = thr_mma.partition_A(gA[:,:,0])
+     &rarr; shape <span class="highlight">(1, (4,2), 8)</span>, stride (0, (1,64), 256)
+              V   M-rows  K-cols
+
+Thread 0 needs the <span class="highlight">same M-rows it owns in C</span>: {0,1,2,3, 64,65,66,67}
+And ALL 8 K-columns (to compute the dot product).
+
+A (128 rows &times; 8 cols), thread 0 reads:
+
+     k=0  k=1  k=2  k=3  k=4  k=5  k=6  k=7
+Row 0: [  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]   &larr; 8 values
+Row 1: [  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+Row 2: [  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+Row 3: [  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+  ...   <span class="dim">(rows 4-63: other threads)</span>
+Row 64:[  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+Row 65:[  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+Row 66:[  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+Row 67:[  &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;    &bull;  ]
+
+Total per k_tile: 8 rows &times; 8 cols = 64 elements
+
+Strides: (1, 64, 256)
+  1   = M-major (consecutive rows in memory)
+  64  = gap between M-groups (row 0 to row 64 = offset 64, since stride-in-M = 1)
+  256 = K-stride (next column = +256 in original A, since A is 256-tall)
+</div>
+
+<h3><code>partition_B</code> for Thread 0, k_tile=0</h3>
+
+<div class="diagram">
+gB[:, :, 0] &rarr; shape (128, 8), stride (1, 128)   &larr; B is N-major (128 tall)
+
+tCgB = thr_mma.partition_B(gB[:,:,0])
+     &rarr; shape <span class="highlight">(1, (4,2), 8)</span>, stride (0, (1,64), 128)
+              V   N-cols  K-cols
+
+Thread 0 needs the <span class="highlight">same N-columns it owns in C</span>: {0,1,2,3, 64,65,66,67}
+And ALL 8 K-columns.
+
+Same pattern as A: 8 rows of B (which are N-indices) &times; 8 K-elements = 64 values.
+</div>
+
+<!-- =================================================================== -->
+<h2>The Inner Compute: What Happens Per k_block</h2>
+
+<div class="diagram">
+k_block = 0 (first of 8 within the BK=8 tile):
+
+  tCrA[:, :, 0] = shape (1, (4,2))  = 8 A-values: A[m, k=0] for m in {0,1,2,3,64,65,66,67}
+  tCrB[:, :, 0] = shape (1, (4,2))  = 8 B-values: B[n, k=0] for n in {0,1,2,3,64,65,66,67}
+  tCrC          = shape (1, (4,2), (4,2)) = 64 accumulators
+
+  cute.gemm does (for scalar FMA atom):
+  ┌─────────────────────────────────────────────────────────┐
+  │  for each m in {0..7}:           (8 M-values)           │
+  │    for each n in {0..7}:         (8 N-values)           │
+  │      C[m,n] += A[m] * B[n]      (1 FMA)                │
+  │                                                         │
+  │  = 64 FMAs for this k_block                             │
+  └─────────────────────────────────────────────────────────┘
+
+  After all 8 k_blocks in this k_tile: 512 FMAs
+  After all 4 k_tiles: 2048 FMAs total for thread 0
+</div>
+
+<!-- =================================================================== -->
+<h2>Step D: Epilogue &mdash; Store Results</h2>
+
+<div class="diagram">
+cute.copy(atom, tCrC, tCgC)
+
+  Source: tCrC &mdash; 64 values in registers, shape (1,(4,2),(4,2))
+  Dest:   tCgC &mdash; 64 locations in global C, stride (0,(128,8192),(1,64))
+
+  The copy atom (CopyUniversalOp) = simple store instruction.
+  Strides in tCgC tell copy where each register value goes in global memory.
+
+  Register[v=0, m=(i,g_m), n=(j,g_n)] &rarr; C[row, col]
+  where:
+    row = i + g_m * 64        (i in 0..3, g_m in 0..1)
+    col = j + g_n * 64        (j in 0..3, g_n in 0..1)
+    address = base + row*128 + col
+</div>
+
+<!-- =================================================================== -->
+<h2>Complete Flow for Thread 0</h2>
+
+<div class="diagram">
+<span class="highlight">Setup (host):</span>
+  TiledMMA = atom(1&times;1&times;1 FMA) &times; layout(16&times;16) + permutation((16,4),(16,4))
+  Grid = (2, 1, 1), Block = (256, 1, 1)
+
+<span class="highlight">Kernel (thread 0, block 0,0):</span>
+
+  A. local_tile:
+     mA(256,32) &rarr; gA(128, 8, 4)      this CTA's A chunk, 4 K-tiles
+     mC(256,128) &rarr; gC(128, 128)       this CTA's output
+
+  B. partition_C:
+     gC(128,128) &rarr; tCgC(1,(4,2),(4,2))   thread 0's 64 output slots
+     allocate tCrC = 64 registers, zeroed
+
+  C. K-loop (&times;4 tiles):
+     gA(:,:,k) &rarr; partition_A &rarr; tCgA(1,(4,2),8) &rarr; copy to tCrA (registers)
+     gB(:,:,k) &rarr; partition_B &rarr; tCgB(1,(4,2),8) &rarr; copy to tCrB (registers)
+
+     Inner loop (&times;8 k_blocks):
+       cute.gemm: tCrC += tCrA[:,:,kb] outer_product tCrB[:,:,kb]
+                  (64 scalar FMAs per k_block)
+
+  D. Epilogue:
+     cute.copy: tCrC(registers) &rarr; tCgC(global memory)
+     64 stores to the 4 scattered 4&times;4 blocks in C
+</div>
+
+<!-- =================================================================== -->
+<h2>Summary Table</h2>
+
+<table>
+<tr><th>Quantity</th><th>Value</th><th>Derivation</th></tr>
+<tr><td>CTAs (blocks)</td><td>2</td><td>ceil(256/128) &times; ceil(128/128) = 2&times;1</td></tr>
+<tr><td>Threads per CTA</td><td>256</td><td>16&times;16 atom grid</td></tr>
+<tr><td>C elements per thread</td><td>64</td><td>128&times;128 / 256</td></tr>
+<tr><td>C element layout</td><td>4 blocks of 4&times;4</td><td>permutation (16,4)&times;(16,4)</td></tr>
+<tr><td>K-tiles (outer loop)</td><td>4</td><td>32 / 8</td></tr>
+<tr><td>K-blocks (inner loop)</td><td>8</td><td>BK=8, atom K=1</td></tr>
+<tr><td>A loads per k_tile</td><td>64</td><td>8 rows &times; 8 K-elements</td></tr>
+<tr><td>B loads per k_tile</td><td>64</td><td>8 rows &times; 8 K-elements</td></tr>
+<tr><td>FMAs total</td><td>2048</td><td>64 outputs &times; K=32</td></tr>
+<tr><td>Registers for accum</td><td>64 &times; f32</td><td>= 256 bytes per thread</td></tr>
+</table>
+
+<!-- =================================================================== -->
+<h2>Naming Convention Reference</h2>
+
+<table>
+<tr><th>Name</th><th>Breakdown</th><th>Meaning</th></tr>
+<tr><td><code>tCgC</code></td><td><code>t</code>-<code>C</code>-<code>g</code>-<code>C</code></td><td><strong>t</strong>hread-partitioned, using <strong>C</strong>'s partition, in <strong>g</strong>lobal mem, of tensor <strong>C</strong></td></tr>
+<tr><td><code>tCgA</code></td><td><code>t</code>-<code>C</code>-<code>g</code>-<code>A</code></td><td><strong>t</strong>hread-partitioned, using <strong>C</strong>'s partition, in <strong>g</strong>lobal mem, of tensor <strong>A</strong></td></tr>
+<tr><td><code>tCrC</code></td><td><code>t</code>-<code>C</code>-<code>r</code>-<code>C</code></td><td><strong>t</strong>hread-partitioned, using <strong>C</strong>'s partition, in <strong>r</strong>egisters, of tensor <strong>C</strong></td></tr>
+<tr><td><code>tCrA</code></td><td><code>t</code>-<code>C</code>-<code>r</code>-<code>A</code></td><td><strong>t</strong>hread-partitioned, using <strong>C</strong>'s partition, in <strong>r</strong>egisters, of tensor <strong>A</strong></td></tr>
+<tr><td><code>gA</code></td><td><code>g</code>-<code>A</code></td><td>CTA-tiled view of <strong>A</strong> in <strong>g</strong>lobal memory</td></tr>
+<tr><td><code>gC</code></td><td><code>g</code>-<code>C</code></td><td>CTA-tiled view of <strong>C</strong> in <strong>g</strong>lobal memory</td></tr>
+</table>
+
+<div class="box green">
+<p><strong>Why is A partitioned "using C's scheme"?</strong></p>
+<p>Because the MMA output (C) determines which (M,N) coordinates each thread owns. That thread must load the matching A rows (same M-indices) and B columns (same N-indices). So <code>partition_A</code> uses the M-component of C's thread mapping.</p>
+</div>
+
+</body>
+</html>

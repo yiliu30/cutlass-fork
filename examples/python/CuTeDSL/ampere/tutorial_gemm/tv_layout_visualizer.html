@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>TV Layout Formula Visualizer</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 2rem auto; max-width: 1200px; background: #1a1a2e; color: #e0e0e0; line-height: 1.7; }
+  h1 { color: #76b900; text-align: center; }
+  h2 { color: #76b900; border-bottom: 2px solid #333; padding-bottom: 0.3rem; margin-top: 2rem; }
+  h3 { color: #00bcd4; }
+  .formula-box { background: #0f0f23; padding: 1.5rem; border-radius: 8px; font-family: 'JetBrains Mono', monospace; font-size: 1rem; text-align: center; margin: 1rem 0; }
+  .controls { display: flex; gap: 2rem; align-items: center; justify-content: center; margin: 1.5rem 0; flex-wrap: wrap; }
+  .control-group { background: #16213e; padding: 1rem 1.5rem; border-radius: 8px; border: 1px solid #333; }
+  .control-group label { display: block; font-weight: bold; color: #76b900; margin-bottom: 0.5rem; }
+  .control-group input[type=range] { width: 200px; }
+  .control-group .value-display { font-family: monospace; font-size: 1.3rem; color: #00bcd4; }
+
+  .matrix-container { display: flex; gap: 3rem; justify-content: center; flex-wrap: wrap; margin: 2rem 0; }
+  .matrix-section { text-align: center; }
+  .matrix-section h3 { margin-bottom: 0.5rem; }
+
+  .matrix { display: inline-grid; gap: 2px; }
+  .matrix-16x8 { grid-template-columns: auto repeat(8, 40px); grid-template-rows: auto repeat(16, 28px); }
+  .cell { display: flex; align-items: center; justify-content: center; border-radius: 3px; font-size: 0.7rem; font-family: monospace; transition: all 0.2s; }
+  .header-cell { background: transparent; color: #888; font-weight: bold; }
+  .data-cell { background: #333; color: #aaa; }
+  .data-cell.highlighted { background: #76b900; color: #000; font-weight: bold; transform: scale(1.1); box-shadow: 0 0 8px #76b900; }
+  .data-cell.same-thread { background: #3a5a1a; color: #76b900; border: 1px solid #76b900; }
+  .data-cell.same-value { background: #1a3a5a; color: #00bcd4; border: 1px solid #00bcd4; }
+
+  .breakdown { background: #16213e; border-radius: 8px; padding: 1.5rem; border: 1px solid #333; margin: 1.5rem 0; }
+  .breakdown-row { display: flex; align-items: center; gap: 1rem; margin: 0.5rem 0; font-family: monospace; font-size: 0.95rem; }
+  .breakdown-label { min-width: 120px; color: #888; }
+  .breakdown-value { color: #76b900; font-weight: bold; }
+  .breakdown-explain { color: #aaa; font-size: 0.85rem; }
+
+  .offset-visual { display: flex; align-items: center; gap: 4px; margin: 1rem 0; justify-content: center; flex-wrap: wrap; }
+  .offset-block { padding: 0.4rem 0.8rem; border-radius: 4px; font-family: monospace; font-size: 0.85rem; font-weight: bold; }
+  .offset-t-inner { background: #1a4a1a; color: #76b900; border: 1px solid #76b900; }
+  .offset-t-outer { background: #4a3a1a; color: #ff9800; border: 1px solid #ff9800; }
+  .offset-v-inner { background: #1a3a5a; color: #00bcd4; border: 1px solid #00bcd4; }
+  .offset-v-outer { background: #4a1a3a; color: #e91e63; border: 1px solid #e91e63; }
+  .offset-plus { color: #666; font-size: 1.2rem; }
+  .offset-equals { color: #fff; font-size: 1.2rem; font-weight: bold; }
+  .offset-result { background: #76b900; color: #000; padding: 0.4rem 1rem; border-radius: 4px; font-weight: bold; }
+
+  .legend { display: flex; gap: 1.5rem; justify-content: center; margin: 1rem 0; flex-wrap: wrap; }
+  .legend-item { display: flex; align-items: center; gap: 0.4rem; font-size: 0.85rem; }
+  .legend-swatch { width: 16px; height: 16px; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<h1>TV Layout Formula — Interactive Visualizer</h1>
+
+<div class="formula-box">
+  <div style="margin-bottom:0.5rem; color:#888;">mma.sync.m16n8k16 — TV_layout_C: shape ((4,8),(2,2)) : stride ((16,1),(8,64))</div>
+  <div>
+    <span style="color:#ff9800">col</span> = tid % 8 &nbsp;&nbsp;&nbsp;
+    <span style="color:#00bcd4">row</span> = (tid / 8) * 2 + (vid % 2) + (vid / 2) * 8
+  </div>
+</div>
+
+<!-- Controls -->
+<div class="controls">
+  <div class="control-group">
+    <label>Thread ID (tid): <span class="value-display" id="tid-display">0</span></label>
+    <input type="range" id="tid-slider" min="0" max="31" value="0">
+    <div style="font-size:0.8rem; color:#888; margin-top:0.3rem;">
+      T_inner (tid%8) = <span id="t-inner">0</span>, &nbsp; T_outer (tid/8) = <span id="t-outer">0</span>
+    </div>
+  </div>
+  <div class="control-group">
+    <label>Value Index (vid): <span class="value-display" id="vid-display">0</span></label>
+    <input type="range" id="vid-slider" min="0" max="3" value="0">
+    <div style="font-size:0.8rem; color:#888; margin-top:0.3rem;">
+      V_inner (vid%2) = <span id="v-inner">0</span>, &nbsp; V_outer (vid/2) = <span id="v-outer">0</span>
+    </div>
+  </div>
+</div>
+
+<!-- Offset breakdown -->
+<div class="breakdown">
+  <h3 style="margin-top:0; text-align:center;">Offset Computation</h3>
+  <div class="offset-visual">
+    <div class="offset-block offset-t-inner" id="block-t-inner">(tid%8)*1 = 0</div>
+    <div class="offset-plus">+</div>
+    <div class="offset-block offset-t-outer" id="block-t-outer">(tid/8)*16 = 0</div>
+    <div class="offset-plus">+</div>
+    <div class="offset-block offset-v-inner" id="block-v-inner">(vid%2)*8 = 0</div>
+    <div class="offset-plus">+</div>
+    <div class="offset-block offset-v-outer" id="block-v-outer">(vid/2)*64 = 0</div>
+    <div class="offset-equals">=</div>
+    <div class="offset-result" id="offset-result">offset 0</div>
+  </div>
+  <div style="text-align:center; margin-top:1rem; font-family:monospace;">
+    &rarr; <span style="color:#ff9800">col = <span id="result-col">0</span></span>, &nbsp;
+    <span style="color:#00bcd4">row = <span id="result-row">0</span></span> &nbsp;
+    &rarr; <span style="color:#76b900; font-weight:bold;">C[<span id="result-cell">0, 0</span>]</span>
+  </div>
+</div>
+
+<!-- Legend -->
+<div class="legend">
+  <div class="legend-item"><div class="legend-swatch" style="background:#76b900;"></div> Current (tid, vid)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#3a5a1a; border:1px solid #76b900;"></div> Same thread (all 4 values)</div>
+  <div class="legend-item"><div class="legend-swatch" style="background:#1a3a5a; border:1px solid #00bcd4;"></div> Same value index (all 32 threads)</div>
+</div>
+
+<!-- Matrix visualization -->
+<div class="matrix-container">
+  <div class="matrix-section">
+    <h3>16&times;8 Output Matrix C</h3>
+    <div class="matrix matrix-16x8" id="matrix-grid">
+      <!-- Generated by JS -->
+    </div>
+  </div>
+</div>
+
+<!-- Thread register view -->
+<h2>Thread <span id="thread-label">0</span>'s Registers</h2>
+<div style="display:flex; gap:1rem; justify-content:center; flex-wrap:wrap; margin:1rem 0;">
+  <div class="control-group" id="reg-v0" style="cursor:pointer;">
+    <label style="color:#00bcd4">v0</label>
+    <div class="value-display" id="reg-v0-val">C[0, 0]</div>
+  </div>
+  <div class="control-group" id="reg-v1" style="cursor:pointer;">
+    <label style="color:#00bcd4">v1</label>
+    <div class="value-display" id="reg-v1-val">C[1, 0]</div>
+  </div>
+  <div class="control-group" id="reg-v2" style="cursor:pointer;">
+    <label style="color:#00bcd4">v2</label>
+    <div class="value-display" id="reg-v2-val">C[8, 0]</div>
+  </div>
+  <div class="control-group" id="reg-v3" style="cursor:pointer;">
+    <label style="color:#00bcd4">v3</label>
+    <div class="value-display" id="reg-v3-val">C[9, 0]</div>
+  </div>
+</div>
+
+<script>
+function getRowCol(tid, vid) {
+  const col = tid % 8;
+  const row = Math.floor(tid / 8) * 2 + (vid % 2) + Math.floor(vid / 2) * 8;
+  return { row, col };
+}
+
+function buildMatrix() {
+  const grid = document.getElementById('matrix-grid');
+  grid.innerHTML = '';
+
+  // Corner cell
+  grid.appendChild(makeCell('', 'header-cell'));
+  // Column headers
+  for (let c = 0; c < 8; c++) {
+    grid.appendChild(makeCell(`c${c}`, 'header-cell'));
+  }
+  // Row headers + data
+  for (let r = 0; r < 16; r++) {
+    grid.appendChild(makeCell(`r${r}`, 'header-cell'));
+    for (let c = 0; c < 8; c++) {
+      const cell = makeCell('', 'data-cell');
+      cell.dataset.row = r;
+      cell.dataset.col = c;
+      // Find which (tid, vid) maps here
+      for (let t = 0; t < 32; t++) {
+        for (let v = 0; v < 4; v++) {
+          const rc = getRowCol(t, v);
+          if (rc.row === r && rc.col === c) {
+            cell.textContent = `T${t}:v${v}`;
+            cell.dataset.tid = t;
+            cell.dataset.vid = v;
+          }
+        }
+      }
+      grid.appendChild(cell);
+    }
+  }
+}
+
+function makeCell(text, cls) {
+  const div = document.createElement('div');
+  div.className = `cell ${cls}`;
+  div.textContent = text;
+  return div;
+}
+
+function update() {
+  const tid = parseInt(document.getElementById('tid-slider').value);
+  const vid = parseInt(document.getElementById('vid-slider').value);
+
+  document.getElementById('tid-display').textContent = tid;
+  document.getElementById('vid-display').textContent = vid;
+  document.getElementById('t-inner').textContent = tid % 8;
+  document.getElementById('t-outer').textContent = Math.floor(tid / 8);
+  document.getElementById('v-inner').textContent = vid % 2;
+  document.getElementById('v-outer').textContent = Math.floor(vid / 2);
+
+  const tInner = (tid % 8) * 1;
+  const tOuter = Math.floor(tid / 8) * 16;
+  const vInner = (vid % 2) * 8;
+  const vOuter = Math.floor(vid / 2) * 64;
+  const offset = tInner + tOuter + vInner + vOuter;
+
+  document.getElementById('block-t-inner').textContent = `(${tid}%8)*1 = ${tInner}`;
+  document.getElementById('block-t-outer').textContent = `(${tid}/8)*16 = ${tOuter}`;
+  document.getElementById('block-v-inner').textContent = `(${vid}%2)*8 = ${vInner}`;
+  document.getElementById('block-v-outer').textContent = `(${vid}/2)*64 = ${vOuter}`;
+  document.getElementById('offset-result').textContent = `offset ${offset}`;
+
+  const { row, col } = getRowCol(tid, vid);
+  document.getElementById('result-col').textContent = col;
+  document.getElementById('result-row').textContent = row;
+  document.getElementById('result-cell').textContent = `${row}, ${col}`;
+
+  // Update register display
+  document.getElementById('thread-label').textContent = tid;
+  for (let v = 0; v < 4; v++) {
+    const rc = getRowCol(tid, v);
+    document.getElementById(`reg-v${v}-val`).textContent = `C[${rc.row}, ${rc.col}]`;
+  }
+
+  // Highlight matrix cells
+  const cells = document.querySelectorAll('.data-cell');
+  cells.forEach(cell => {
+    cell.className = 'cell data-cell';
+    const cr = parseInt(cell.dataset.row);
+    const cc = parseInt(cell.dataset.col);
+
+    // Same thread highlight
+    for (let v = 0; v < 4; v++) {
+      const rc = getRowCol(tid, v);
+      if (rc.row === cr && rc.col === cc) {
+        cell.classList.add('same-thread');
+      }
+    }
+
+    // Same value index highlight
+    for (let t = 0; t < 32; t++) {
+      const rc = getRowCol(t, vid);
+      if (rc.row === cr && rc.col === cc) {
+        cell.classList.add('same-value');
+      }
+    }
+
+    // Exact match
+    if (cr === row && cc === col) {
+      cell.className = 'cell data-cell highlighted';
+    }
+  });
+}
+
+// Init
+buildMatrix();
+update();
+
+document.getElementById('tid-slider').addEventListener('input', update);
+document.getElementById('vid-slider').addEventListener('input', update);
+
+// Click register boxes to set vid
+for (let v = 0; v < 4; v++) {
+  document.getElementById(`reg-v${v}`).addEventListener('click', () => {
+    document.getElementById('vid-slider').value = v;
+    update();
+  });
+}
+</script>
+
+</body>
+</html>

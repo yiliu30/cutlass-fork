@@ -476,6 +476,8 @@ class IntegerMeta(NumericMeta):
             np_dtype = None
         elif width == 4:
             np_dtype = None
+        elif width == 2:
+            np_dtype = None
         elif signed:
             np_dtype = getattr(np, f"int{width}")
         else:
@@ -1244,12 +1246,14 @@ class Numeric(metaclass=NumericMeta, is_abstract=True):
             T.i16(): Int16,
             T.i8(): Int8,
             T.IntegerType.get_signless(4): Int4,
+            T.IntegerType.get_signless(2): Int2,
             T.si(128): Int128,
             T.si64(): Int64,
             T.si32(): Int32,
             T.si16(): Int16,
             T.si8(): Int8,
             T.IntegerType.get_signed(4): Int4,
+            T.IntegerType.get_signed(2): Int2,
             T.ui(128): Uint128,
             T.ui64(): Uint64,
             T.ui32(): Uint32,
@@ -1592,6 +1596,15 @@ class Boolean(Integer, metaclass=IntegerMeta, width=1, signed=True, mlir_type=T.
         raise TypeError("Negation, the operator `-` is not supported for boolean type")
 
 
+class Int2(
+    Integer,
+    metaclass=IntegerMeta,
+    width=2,
+    signed=True,
+    mlir_type=lambda: T.IntegerType.get_signless(2),
+): ...
+
+
 class Int4(
     Integer,
     metaclass=IntegerMeta,
@@ -1743,6 +1756,7 @@ _unsupported_dst_float_types = [
 
 
 ALL_DTYPES = {
+    Int2,
     Int4,
     Int8,
     Int16,
@@ -1972,6 +1986,7 @@ __all__ = [
     "Int128",
     "Int8",
     "Int4",
+    "Int2",
     "Uint8",
     "Uint16",
     "Uint32",

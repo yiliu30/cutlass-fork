@@ -370,6 +370,7 @@ __all__ = [
     "Numeric",
     "Integer",
     "Boolean",
+    "Int2",
     "Int4",
     "Int8",
     "Int16",

@@ -176,6 +176,94 @@ def create_i4_tensor_and_scale(
     )
 
 
+def create_i2_tensor_and_scale(
+    l: int,
+    m: int,
+    k: int,
+    is_m_major: bool,
+    dtype: type[cutlass.Numeric],
+    shuffle_a: bool,
+    scale_granularity_m: int,
+    scale_granularity_k: int,
+    is_dynamic_layout: bool = True,
+    divisibility: int = 16,
+    transformed_dtype: Optional[type[cutlass.Numeric]] = None,
+) -> tuple[
+    cute.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    cute.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """
+    Create a quantized 2-bit tensor A and its corresponding scale tensor.
+
+    int2 A is supported in **k-major layout only**. 16 int2 values pack into one
+    int32 word along K, and the packed words occupy the first quarter of an
+    over-allocated int8 buffer that is then reinterpreted as ``element_type=Int2``
+    (the same trick the int4 path uses, but packed 4x denser). The int4 host helper
+    routes through ``cute.testing.convert``, which is hard-wired to width-4/8 and
+    cannot pack width-2 — so int2 packs the bytes manually instead. m-major and
+    shuffle are not supported for int2.
+    """
+    if is_m_major:
+        raise NotImplementedError(
+            "int2 A is only supported in k-major layout (use --a_major k)"
+        )
+    if shuffle_a:
+        raise NotImplementedError("int2 A does not support shuffle")
+    INT2_PER_WORD = 16
+    assert k % INT2_PER_WORD == 0, "k must be a multiple of 16 for int2 packing"
+    num_scales = k // scale_granularity_k
+
+    # Logical int2 values in {-2,-1,0,1} (all four codes), shape (m, k, l) row-major.
+    a_quant = torch.randint(-2, 2, (m, k, l), dtype=torch.int32)
+    # Random integer scales per scale_granularity_k group, bf16, m-major.
+    a_scales = torch.randint(-3, 3, (m, num_scales, l)).to(torch.bfloat16)
+    # Scale tensor is always m-major (mirror the int4 layout permute dance).
+    a_scales = (
+        a_scales.permute(2, 1, 0).contiguous().permute(2, 1, 0).to(device="cuda")
+    )
+
+    # Pack 16 int2 -> one int32 along K, then drop the words into the first quarter
+    # of an over-allocated int8 buffer whose k-major strides are (k, 1, m*k). The
+    # Int2 element view reads 4 fields/byte from that quarter, k-contiguous.
+    a2 = a_quant & 0x3
+    a_grp = a2.reshape(m, k // INT2_PER_WORD, INT2_PER_WORD, l)
+    packed = torch.zeros(m, k // INT2_PER_WORD, l, dtype=torch.int32)
+    for j in range(INT2_PER_WORD):
+        packed |= a_grp[:, :, j, :] << (2 * j)
+    packed_bytes = packed.contiguous().view(torch.int8).flatten().to(device="cuda")
+    buf = torch.zeros(m * k * l, dtype=torch.int8, device="cuda")
+    buf[: packed_bytes.numel()] = packed_bytes
+    buf = torch.as_strided(buf, (m, k, l), (k, 1, m * k))
+
+    cute_a_quant_tensor = from_dlpack(buf, assumed_align=divisibility)
+    cute_a_quant_tensor.element_type = cutlass.Int2
+    if is_dynamic_layout:
+        leading_dim = next(i for i, s in enumerate(buf.stride()) if s == 1)
+        cute_a_quant_tensor = cute_a_quant_tensor.mark_layout_dynamic(
+            leading_dim=leading_dim
+        )
+
+    cute_scale_tensor = from_dlpack(a_scales, assumed_align=divisibility)
+    if is_dynamic_layout:
+        leading_dim = next(i for i, s in enumerate(a_scales.stride()) if s == 1)
+        cute_scale_tensor = cute_scale_tensor.mark_layout_dynamic(
+            leading_dim=leading_dim
+        )
+
+    return (
+        cute_a_quant_tensor,
+        buf,
+        a_quant.to(dtype=torch.float32).to("cpu"),
+        cute_scale_tensor,
+        a_scales,
+        a_scales.to("cpu"),
+    )
+
+
 def create_tensor_a(
     l: int,
     m: int,
@@ -201,6 +289,26 @@ def create_tensor_a(
             a_scale_torch_gpu,
             a_scale_torch_cpu,
         ) = create_i4_tensor_and_scale(
+            l,
+            m,
+            k,
+            a_major == "m",
+            a_dtype,
+            shuffle_a,
+            scale_granularity_m,
+            scale_granularity_k,
+            divisibility=mixed_input_utils.get_divisibility(m if a_major == "m" else k),
+            transformed_dtype=transformed_dtype,
+        )
+    elif a_dtype in (cutlass.Int2,):
+        (
+            a_tensor,
+            a_torch_gpu,
+            a_torch_cpu,
+            a_scale_tensor,
+            a_scale_torch_gpu,
+            a_scale_torch_cpu,
+        ) = create_i2_tensor_and_scale(
             l,
             m,
             k,

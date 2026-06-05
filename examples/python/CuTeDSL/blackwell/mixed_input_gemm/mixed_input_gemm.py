@@ -2253,7 +2253,7 @@ if __name__ == "__main__":
         "--a_dtype",
         type=cutlass.dtype,
         default=cutlass.Int4,
-        choices=[cutlass.Int8, cutlass.Uint8, cutlass.Int4],
+        choices=[cutlass.Int8, cutlass.Uint8, cutlass.Int4, cutlass.Int2],
     )
     parser.add_argument(
         "--b_dtype",

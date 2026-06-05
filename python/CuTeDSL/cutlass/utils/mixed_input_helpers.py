@@ -660,6 +660,13 @@ def is_valid_scale_granularity(
             or scale_granularity_k % mma_tiler_k != 0
         ):
             return False
+    elif a_dtype.width == 2:
+        if scale_granularity_m != 1 or (
+            scale_granularity_k == 0
+            or k % scale_granularity_k != 0
+            or scale_granularity_k % mma_tiler_k != 0
+        ):
+            return False
     return True
 
 

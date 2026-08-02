@@ -291,18 +291,66 @@ def host_gemm(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     atoms_layout = cute.make_layout((16, 16, 1), stride=(16, 1, 0))
 
     # -------------------------------------------------------------------------
-    # permutation: expands native 16×16 coverage → full 128×128 tile
-    # (16,4):(4,1) means F=16, R=4
-    #   → each thread handles R=4 consecutive elements per group
-    #   → F=16 groups spaced by 4 = total 64 positions per dimension? No:
-    #   → product = 16×4 = 64 positions per thread-row (but only 8 per thread)
-    #   → Actually: permutation_product=64, tile=128, reps=128/64=2
-    #   → So each thread gets 64/16_threads_in_that_dim...
+    # PERMUTATION — THE ONE DESIGN CHOICE
+    # -------------------------------------------------------------------------
+    # permutation = (Groups, Chunk):(group_stride, chunk_stride)
     #
-    # Simpler: each of 16 threads in M covers 128/16 = 8 M-positions.
-    # The permutation (16,4):(4,1) controls HOW those 8 are arranged:
-    #   - 4 consecutive (stride 1) + jump to next group (stride 4×16=64 apart)
-    #   - Result: positions [0,1,2,3] and [64,65,66,67] for thread 0
+    #   Groups       = how many groups to divide positions into (one per thread)
+    #   Chunk        = how many consecutive positions per group
+    #   group_stride = distance between the START of adjacent groups
+    #   chunk_stride = distance between elements WITHIN a group
+    #
+    # Thread k, element r → position = k × group_stride + r × chunk_stride
+    #
+    # The permutation covers Groups×Chunk positions total.
+    # If tile_dim > Groups×Chunk, a "rest" factor repeats the pattern:
+    #   rest = tile_dim / (Groups × Chunk)
+    # Total positions per thread = Chunk × rest
+    #
+    # -------------------------------------------------------------------------
+    # (16, 4):(4, 1) means:
+    #   16 groups, 4 elements per group (chunk), groups start 4 apart, elements stride 1
+    #   Group k starts at position k×4, contains {k*4, k*4+1, k*4+2, k*4+3}
+    #   Covers 16×4 = 64 positions. Tile=128, rest=2 → second copy at +64.
+    #   Thread 0 → {0,1,2,3} ∪ {64,65,66,67} = 8 positions
+    #
+    # -------------------------------------------------------------------------
+    # ALTERNATIVES (same thread count, same element count, different patterns):
+    #
+    # (16,4):(4,1)  Thread 0 → {0,1,2,3, 64,65,66,67}
+    #               chunk=4 consecutive, chunk_stride=1 (good for 128-bit vectorized loads)
+    #
+    # (16,4):(1,16) Thread 0 → {0,16,32,48, 64,80,96,112}
+    #               chunk=4, chunk_stride=16 (scattered, bad for vectorization)
+    #
+    # (16,8):(8,1)  Thread 0 → {0,1,2,3,4,5,6,7}
+    #               chunk=8 consecutive, no rest (simplest, but less A/B data reuse)
+    #
+    # -------------------------------------------------------------------------
+    # logical_divide result (M-dim, base stride=128 because C is row-major (M,N):(N,1)):
+    #
+    # Permutation        | Result shape:stride             | Thread 0 rows
+    # (16,4):(4,1)       | (16,4,2):(512,128,8192)        | {0,1,2,3,64,65,66,67}
+    # (16,4):(1,16)      | (16,4,2):(128,2048,8192)       | {0,16,32,48,64,80,96,112}
+    # (16,8):(8,1)       | (16,8):(1024,128)              | {0,1,2,3,4,5,6,7}
+    #
+    # Formula: output_stride = perm_stride × input_base_stride
+    #   e.g., group_stride=4 × base=128 = 512 (group spacing in memory)
+    #
+    # -------------------------------------------------------------------------
+    # logical_divide result (N-dim, base stride=1 because C is row-major (M,N):(N,1)):
+    #
+    # Permutation        | Result shape:stride             | Thread 0 cols
+    # (16,4):(4,1)       | (16,4,2):(4,1,64)              | {0,1,2,3,64,65,66,67}
+    # (16,4):(1,16)      | (16,4,2):(1,16,64)             | {0,16,32,48,64,80,96,112}
+    # (16,8):(8,1)       | (16,8):(8,1)                   | {0,1,2,3,4,5,6,7}
+    #
+    # Formula: output_stride = perm_stride × input_base_stride
+    #   e.g., group_stride=4 × base=1 = 4 (group spacing in columns)
+    #
+    # NOTE: With SAME permutation (16,4):(4,1) for both M and N:
+    #   Thread 0 owns rows {0,1,2,3,64,65,66,67} × cols {0,1,2,3,64,65,66,67}
+    #   = 8×8 = 64 elements of C (the 4×4 blocks pattern in the visual)
     # -------------------------------------------------------------------------
     permutation_M = cute.make_layout((16, 4), stride=(4, 1))
     permutation_N = cute.make_layout((16, 4), stride=(4, 1))

@@ -50,6 +50,72 @@ cutlass_example_add_executable(
   ${GEMM_ARGS}
 )
 
+set(GEMM_INT_ARGS "--m=256 --n=256 --k=512 --l=1 --iterations=1 --verify=1")
+
+cutlass_example_add_executable(
+  00_bmg_gemm_int8
+  00_bmg_gemm.cpp
+  TEST_COMMAND_OPTIONS
+  ${GEMM_INT_ARGS}
+)
+target_compile_definitions(00_bmg_gemm_int8 PRIVATE BMG_GEMM_INT8)
+
+cutlass_example_add_executable(
+  00_bmg_gemm_int4
+  00_bmg_gemm.cpp
+  TEST_COMMAND_OPTIONS
+  ${GEMM_INT_ARGS}
+)
+target_compile_definitions(00_bmg_gemm_int4 PRIVATE
+  BMG_GEMM_INT4
+  BMG_GEMM_TILE_M=256
+  BMG_GEMM_TILE_N=256
+  BMG_GEMM_TILE_K=128
+  BMG_GEMM_LAYOUT_B_COLUMN)
+
+if (CUTLASS_ENABLE_SYCL)
+  target_link_options(00_bmg_gemm_int8 PRIVATE -Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
+  target_link_options(00_bmg_gemm_int4 PRIVATE -Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
+endif()
+
+foreach(config IN ITEMS
+    "s4_256x256x64;BMG_GEMM_INT4;256;256;64;8x4;row"
+    "s4_256x256x128;BMG_GEMM_INT4;256;256;128;8x4;row"
+    "s4_128x256x128;BMG_GEMM_INT4;128;256;128;8x4;row"
+    "s4_256x128x128_sg4x8;BMG_GEMM_INT4;256;128;128;4x8;row"
+    "s4_256x256x128_colb;BMG_GEMM_INT4;256;256;128;8x4;col"
+    "u4_256x256x128;BMG_GEMM_UINT4;256;256;128;8x4;row"
+    "u4_256x256x128_colb;BMG_GEMM_UINT4;256;256;128;8x4;col")
+  list(GET config 0 suffix)
+  list(GET config 1 dtype_macro)
+  list(GET config 2 tile_m)
+  list(GET config 3 tile_n)
+  list(GET config 4 tile_k)
+  list(GET config 5 sg_layout)
+  list(GET config 6 b_layout)
+  set(target 00_bmg_gemm_int4_${suffix})
+  cutlass_example_add_executable(
+    ${target}
+    00_bmg_gemm.cpp
+    TEST_COMMAND_OPTIONS
+    ${GEMM_INT_ARGS}
+  )
+  target_compile_definitions(${target} PRIVATE
+    ${dtype_macro}
+    BMG_GEMM_TILE_M=${tile_m}
+    BMG_GEMM_TILE_N=${tile_n}
+    BMG_GEMM_TILE_K=${tile_k})
+  if (sg_layout STREQUAL "4x8")
+    target_compile_definitions(${target} PRIVATE BMG_GEMM_SG_LAYOUT_4X8)
+  endif()
+  if (b_layout STREQUAL "col")
+    target_compile_definitions(${target} PRIVATE BMG_GEMM_LAYOUT_B_COLUMN)
+  endif()
+  if (CUTLASS_ENABLE_SYCL)
+    target_link_options(${target} PRIVATE -Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
+  endif()
+endforeach()
+
 cutlass_example_add_executable(
   00_bmg_gemm_padded
   00_bmg_gemm_padded.cpp

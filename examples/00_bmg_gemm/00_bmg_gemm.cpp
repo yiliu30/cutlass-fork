@@ -83,6 +83,38 @@ using namespace cute;
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
+#if defined(BMG_GEMM_INT4) || defined(BMG_GEMM_INT8)
+using OptionsScalar = int32_t;
+#elif defined(BMG_GEMM_UINT4)
+using OptionsScalar = uint32_t;
+#else
+using OptionsScalar = float;
+#endif
+
+#ifndef BMG_GEMM_TILE_M
+#define BMG_GEMM_TILE_M 256
+#endif
+
+#ifndef BMG_GEMM_TILE_N
+#define BMG_GEMM_TILE_N 256
+#endif
+
+#ifndef BMG_GEMM_TILE_K
+#if defined(BMG_GEMM_INT4)
+#define BMG_GEMM_TILE_K 64
+#else
+#define BMG_GEMM_TILE_K 32
+#endif
+#endif
+
+#ifndef BMG_GEMM_PIPELINE_STAGES
+#define BMG_GEMM_PIPELINE_STAGES 2
+#endif
+
+#if defined(BMG_GEMM_INT4) && defined(BMG_GEMM_UINT4)
+#error "Define only one of BMG_GEMM_INT4 or BMG_GEMM_UINT4"
+#endif
+
 // Command line options parsing
 struct Options {
 
@@ -92,13 +124,13 @@ struct Options {
   int m, n, k, l, iterations, verify;
   // The `verify` controls whether verification will be executed, which is true
   // by default. Users can skip the verification step by specifying it with 0.
-  float alpha, beta;
+  OptionsScalar alpha, beta;
 
   Options():
     help(false),
     error(false),
     m(5120), n(4096), k(4096), l(1), iterations(20), verify(1), 
-    alpha(1.f), beta(0.f)
+    alpha(1), beta(0)
   { }
 
   // Parses the command line
@@ -114,8 +146,8 @@ struct Options {
     cmd.get_cmd_line_argument("n", n, 4096);
     cmd.get_cmd_line_argument("k", k, 4096);
     cmd.get_cmd_line_argument("l", l, 1);
-    cmd.get_cmd_line_argument("alpha", alpha, 1.f);
-    cmd.get_cmd_line_argument("beta", beta, 0.f);
+    cmd.get_cmd_line_argument("alpha", alpha, OptionsScalar(1));
+    cmd.get_cmd_line_argument("beta", beta, OptionsScalar(0));
     cmd.get_cmd_line_argument("iterations", iterations, 100);
     cmd.get_cmd_line_argument("verify", verify, 1);
   }
@@ -249,6 +281,18 @@ struct ExampleRunner {
   cutlass::Status run(const Options& options, const cutlass::KernelHardwareInfo& hw_info) {
     ProblemShapeType problem_size = ProblemShapeType{options.m, options.n, options.k, options.l};
 
+#if defined(BMG_GEMM_INT4) || defined(BMG_GEMM_UINT4)
+    if (options.k % 64 != 0) {
+      std::cout << "Invalid Problem Size: INT4 GEMM requires K to be a multiple of 64." << std::endl;
+      return cutlass::Status::kErrorInvalidProblem;
+    }
+#elif defined(BMG_GEMM_INT8)
+    if (options.k % 32 != 0) {
+      std::cout << "Invalid Problem Size: INT8 GEMM requires K to be a multiple of 32." << std::endl;
+      return cutlass::Status::kErrorInvalidProblem;
+    }
+#endif
+
     initialize(problem_size);
 
     typename Gemm::GemmKernel::Arguments arguments{
@@ -295,9 +339,13 @@ struct ExampleRunner {
       compat::wait();
 
       float cute_time = timer.seconds() / options.iterations;
-      double tflops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
+      double tops = (2.0 * options.m * options.n * options.k * options.l) * 1e-12;
       std::cout << "Problem Size: " << options.m << 'x' << options.n << 'x' << options.k << 'x' << options.l << std::endl;
-      printf("Cutlass GEMM Performance:     [%4.3f]TFlop/s  (%6.4f)ms\n", tflops / cute_time, cute_time*1000);
+#if defined(BMG_GEMM_INT4) || defined(BMG_GEMM_UINT4) || defined(BMG_GEMM_INT8)
+      printf("Cutlass GEMM Performance:     [%4.3f]TOPS  (%6.4f)ms\n", tops / cute_time, cute_time*1000);
+#else
+      printf("Cutlass GEMM Performance:     [%4.3f]TFlop/s  (%6.4f)ms\n", tops / cute_time, cute_time*1000);
+#endif
     }
 
     return cutlass::Status::kSuccess;
@@ -341,14 +389,38 @@ int main(int argc, const char** argv)
 
   // The code section below describes datatype for input, output matrices and computation between
   // elements in input matrices.
+#if defined(BMG_GEMM_INT4)
+  using ElementAccumulator = int32_t;    // <- data type of accumulator
+  using ElementComputeEpilogue = int32_t;// <- data type of epilogue operations
+  using ElementInputA = int4_t;          // <- data type of elements in input matrix A
+  using ElementInputB = int4_t;          // <- data type of elements in input matrix B
+  using ElementOutput = int32_t;         // <- data type of elements in output matrix D
+#elif defined(BMG_GEMM_UINT4)
+  using ElementAccumulator = uint32_t;   // <- data type of accumulator
+  using ElementComputeEpilogue = uint32_t;// <- data type of epilogue operations
+  using ElementInputA = uint4_t;         // <- data type of elements in input matrix A
+  using ElementInputB = uint4_t;         // <- data type of elements in input matrix B
+  using ElementOutput = uint32_t;        // <- data type of elements in output matrix D
+#elif defined(BMG_GEMM_INT8)
+  using ElementAccumulator = int32_t;    // <- data type of accumulator
+  using ElementComputeEpilogue = int32_t;// <- data type of epilogue operations
+  using ElementInputA = int8_t;          // <- data type of elements in input matrix A
+  using ElementInputB = int8_t;          // <- data type of elements in input matrix B
+  using ElementOutput = int32_t;         // <- data type of elements in output matrix D
+#else
   using ElementAccumulator = float;      // <- data type of accumulator
   using ElementComputeEpilogue = float;  // <- data type of epilogue operations
   using ElementInputA = bfloat16_t;      // <- data type of elements in input matrix A
   using ElementInputB = bfloat16_t;      // <- data type of elements in input matrix B
   using ElementOutput = float;           // <- data type of elements in output matrix D
+#endif
 
   using LayoutA = cutlass::layout::RowMajor;
+#if defined(BMG_GEMM_LAYOUT_B_COLUMN)
+  using LayoutB = cutlass::layout::ColumnMajor;
+#else
   using LayoutB = cutlass::layout::RowMajor;
+#endif
   using LayoutC = cutlass::layout::RowMajor;
   using LayoutD = cutlass::layout::RowMajor;
 
@@ -361,7 +433,33 @@ int main(int argc, const char** argv)
   using GmemTiledCopyB = void; //XE_LOAD_2D_VNNI<16, 32, 32>;
 
   // Workgroup-level tile
-  using TileShape = Shape<_256, _256, _32>;
+#if BMG_GEMM_TILE_M == 128
+  using TileM = _128;
+#elif BMG_GEMM_TILE_M == 256
+  using TileM = _256;
+#else
+  static_assert(BMG_GEMM_TILE_M == 128 || BMG_GEMM_TILE_M == 256, "Unsupported BMG_GEMM_TILE_M");
+#endif
+
+#if BMG_GEMM_TILE_N == 128
+  using TileN = _128;
+#elif BMG_GEMM_TILE_N == 256
+  using TileN = _256;
+#else
+  static_assert(BMG_GEMM_TILE_N == 128 || BMG_GEMM_TILE_N == 256, "Unsupported BMG_GEMM_TILE_N");
+#endif
+
+#if BMG_GEMM_TILE_K == 32
+  using TileK = _32;
+#elif BMG_GEMM_TILE_K == 64
+  using TileK = _64;
+#elif BMG_GEMM_TILE_K == 128
+  using TileK = _128;
+#else
+  static_assert(BMG_GEMM_TILE_K == 32 || BMG_GEMM_TILE_K == 64 || BMG_GEMM_TILE_K == 128, "Unsupported BMG_GEMM_TILE_K");
+#endif
+
+  using TileShape = Shape<TileM, TileN, TileK>;
 
   // A TiledMMA struct defines a tiling of an MMA atom over M, N and K, combining both additional
   // hardware (sub-groups for Intel BMG) and iterations by each sub-group.
@@ -374,10 +472,26 @@ int main(int argc, const char** argv)
   // each sub-group operates on a contiguous 32x64x32 chunk (4x4x2 iterations). See
   // 0t_mma_atom.md#TiledMMAs for more info. Sub-groups are arranged row-major (stride 4,1,0) for
   // performance reasons.
-  using TiledMma = typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>, Layout<TileShape>, Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>>::TiledMMA;
+  using SGLayout =
+#if defined(BMG_GEMM_SG_LAYOUT_4X8)
+      Layout<Shape<_4, _8, _1>, Stride<_8, _1, _0>>;
+#else
+      Layout<Shape<_8, _4, _1>, Stride<_4, _1, _0>>;
+#endif
+
+  using TiledMma =
+#if defined(BMG_GEMM_INT4)
+      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, int32_t, int4_t, int4_t, int32_t>>, Layout<TileShape>, SGLayout>::TiledMMA;
+#elif defined(BMG_GEMM_UINT4)
+      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, uint32_t, uint4_t, uint4_t, uint32_t>>, Layout<TileShape>, SGLayout>::TiledMMA;
+#elif defined(BMG_GEMM_INT8)
+      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, int32_t, int8_t, int8_t, int32_t>>, Layout<TileShape>, SGLayout>::TiledMMA;
+#else
+      typename TiledMMAHelper<MMA_Atom<XE_DPAS_TT<8, float, cute::bfloat16_t>>, Layout<TileShape>, SGLayout>::TiledMMA;
+#endif
 
   // For Intel BMG, PipelineStages defines how many k-blocks ahead to prefetch from A and B.
-  constexpr int PipelineStages = 2;
+  constexpr int PipelineStages = BMG_GEMM_PIPELINE_STAGES;
   // For older version of copy/mma atom, use cutlass::gemm::MainloopIntelXeXMX16 as dispatch policy
   using GEMMDispatchPolicy = cutlass::gemm::MainloopXeL1Staged<PipelineStages>;
   using EpilogueDispatchPolicy = cutlass::epilogue::IntelXeGeneric;

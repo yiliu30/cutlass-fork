@@ -62,6 +62,9 @@
 
 #if defined(CUTLASS_ENABLE_SYCL)
 #include "cutlass/util/sycl_event_manager.hpp"
+#if defined(SYCL_INTEL_TARGET)
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+#endif
 #endif
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -567,7 +570,10 @@ public:
           auto event = launch<device_kernel<GemmKernel>>(launch_policy{
             sycl_grid, sycl_block, local_mem_size{static_cast<std::size_t>(smem_size)}
 #if defined(SYCL_INTEL_TARGET)
-            , kernel_properties{sycl_exp::sub_group_size<DispatchPolicy::SubgroupSize>}
+            , kernel_properties{
+              sycl_exp::sub_group_size<DispatchPolicy::SubgroupSize>,
+              sycl::ext::intel::experimental::grf_size<256>
+            }
 #endif
           }, q, params);
           EventManager::getInstance().addEvent(event);
@@ -575,7 +581,10 @@ public:
           launch<device_kernel<GemmKernel>, sycl::detail::auto_name, false>(launch_policy{
             sycl_grid, sycl_block, local_mem_size{static_cast<std::size_t>(smem_size)}
 #if defined(SYCL_INTEL_TARGET)
-            , kernel_properties{sycl_exp::sub_group_size<DispatchPolicy::SubgroupSize>}
+            , kernel_properties{
+              sycl_exp::sub_group_size<DispatchPolicy::SubgroupSize>,
+              sycl::ext::intel::experimental::grf_size<256>
+            }
 #endif
           }, q, params);
 #endif
@@ -594,7 +603,8 @@ public:
             return compat::experimental::kernel_properties<EmptyProperties>{};
           } else {
             return compat::experimental::kernel_properties{
-              sycl::ext::oneapi::experimental::sub_group_size<DispatchPolicy::SubgroupSize>
+              sycl::ext::oneapi::experimental::sub_group_size<DispatchPolicy::SubgroupSize>,
+              sycl::ext::intel::experimental::grf_size<256>
             };
           }
         }();

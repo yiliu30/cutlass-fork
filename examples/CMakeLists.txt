@@ -112,6 +112,9 @@ if(CUTLASS_ENABLE_SYCL)
       05_bmg_gemm_with_epilogues
       05_bmg_gemm_with_epilogues/legacy
       06_bmg_flash_attention
+      06_bmg_flash_attention_opt
+      06_bmg_flash_attention_pipeline
+      06_bmg_flash_attention_schedule_trials
       06_bmg_flash_attention/legacy
       07_bmg_dual_gemm
       08_bmg_gemm_f8
@@ -132,4 +135,3 @@ else()
   message(STATUS "CUTLASS_ENABLE_SYCL is OFF - no examples will be built")
   message(STATUS "Enable SYCL support to build CUTLASS examples")
 endif()
-

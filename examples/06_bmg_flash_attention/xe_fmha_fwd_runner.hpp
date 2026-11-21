@@ -51,6 +51,10 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#ifdef CUTLASS_BMG_FMHA_TRACE
+#include "xe_fmha_trace.hpp"
+#endif
+
 using namespace cute;
 
 // Command line options parsing
@@ -65,6 +69,10 @@ struct Options {
 
   int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify, seq_chunk_len;
   float softmax_scale;
+#ifdef CUTLASS_BMG_FMHA_TRACE
+  std::string trace_file;
+  int trace_tiles = 8;
+#endif
 
   Options()
       : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
@@ -128,6 +136,17 @@ struct Options {
     }
 
     softmax_scale = 1 / sqrt(static_cast<float>(head_size_qk));
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    cmd.get_cmd_line_argument("trace", trace_file, std::string{});
+    cmd.get_cmd_line_argument("trace_tiles", trace_tiles, 8);
+    if (!trace_file.empty() &&
+        (trace_tiles < 1 || trace_tiles > 32 || varlen || is_causal || use_paged_kv ||
+         seq_len_kv_cache != 0 || scheduler != "Individual")) {
+      std::cerr << "--trace requires fixed-length non-causal prefill, the Individual "
+                   "scheduler, no KV cache, and --trace_tiles in [1, 32].\n";
+      error = true;
+    }
+#endif
   }
 
   /// Prints the usage statement.
@@ -154,6 +173,10 @@ struct Options {
         << "  --verify=<int>              Specify whether to verify.\n"
         << "  --seq_chunk_len=<int>       KV chunk length for sequence-parallel (LSE) runs.\n"
         << "                              <=0 means a single full chunk.\n\n";
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    out << "  --trace=<path>              Write Chrome/Perfetto JSON from one extra dispatch.\n"
+        << "  --trace_tiles=<int>         Number of initial KV tiles to trace (default: 8).\n";
+#endif
     return out;
   }
 };
@@ -1126,6 +1149,41 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
                 << "\t Scheduler: " << options.scheduler;
       printf("\nPerformance:   %4.3f  GB/s,    %4.3f  TFlop/s,   %6.4f  ms\n\n", gbps, tflops, cute_time * 1000);
     }
+
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    if (!options.trace_file.empty()) {
+      auto queue = compat::get_default_queue();
+      if (!queue.get_device().has(sycl::aspect::ext_oneapi_clock_sub_group)) {
+        std::cerr << "FMHA tracing requires a device with a subgroup clock.\n";
+        return cutlass::Status::kErrorNotSupported;
+      }
+      constexpr int spans_per_tile = CollectiveMainloop::trace_spans_per_tile;
+      constexpr int qk_spans = CollectiveMainloop::trace_qk_spans;
+      int tiles = std::min(options.trace_tiles, int(cute::ceil_div(
+          options.seq_len_kv, get<1>(typename CollectiveMainloop::TileShapeQK{}))));
+      size_t count = cutlass::fmha::fmha_trace_subgroups * tiles * spans_per_tile;
+      using Span = cutlass::fmha::FmhaTraceSpan;
+      cutlass::device_memory::allocation<Span> trace(count);
+      queue.memset(trace.get(), 0, count * sizeof(Span)).wait_and_throw();
+      arguments.mainloop.trace = trace.get();
+      arguments.mainloop.trace_tiles = tiles;
+      run(FMHAKernel::to_underlying_arguments(arguments, workspace.get()));
+      queue.wait_and_throw();
+      if (options.verify != 0) {
+        bool passed = verify(shape, options.is_causal);
+        std::cout << "Traced dispatch: " << (passed ? "Passed" : "Failed") << '\n';
+        if (!passed) {
+          return cutlass::Status::kErrorInternal;
+        }
+      }
+      std::vector<Span> spans(count);
+      queue.memcpy(spans.data(), trace.get(), count * sizeof(Span)).wait_and_throw();
+      if (!fmha_trace::write(options.trace_file, spans, tiles, spans_per_tile, qk_spans,
+                            fmha_trace::microseconds_per_tick(queue))) {
+        return cutlass::Status::kErrorInternal;
+      }
+    }
+#endif
 
     return cutlass::Status::kSuccess;
   }

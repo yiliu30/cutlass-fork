@@ -57,7 +57,52 @@ struct FmhaTraceSpan {
   uint64_t end;
 };
 
-inline constexpr int fmha_trace_subgroups = 2;
+inline constexpr uint32_t fmha_trace_no_placement = ~uint32_t{0};
+
+inline uint32_t fmha_trace_read_sr0() {
+#if defined(__SYCL_DEVICE_ONLY__) && defined(SYCL_INTEL_TARGET)
+  uint32_t sr0;
+  asm volatile("mov (M1_NM, 1) %0(0,0)<1> %%sr0(0,0)<0;1,0>" : "=rw"(sr0));
+  return sr0 & 0xffff;
+#else
+  return fmha_trace_no_placement;
+#endif
+}
+
+enum FmhaTraceQKPhase {
+  fmha_trace_k_load,
+  fmha_trace_k_reorder,
+  fmha_trace_qk_dpas,
+  fmha_trace_qk_phase_count
+};
+
+enum FmhaTraceSoftmaxPhase {
+  fmha_trace_softmax_total,
+  fmha_trace_row_max,
+  fmha_trace_rescale_factor,
+  fmha_trace_exp_sum,
+  fmha_trace_p_pack,
+  fmha_trace_softmax_phase_count
+};
+
+enum FmhaTracePVPhase {
+  fmha_trace_v_load,
+  fmha_trace_v_reorder,
+  fmha_trace_output_correction,
+  fmha_trace_pv_dpas,
+  fmha_trace_pv_phase_count
+};
+
+struct FmhaTraceLayout {
+  static constexpr int tile_start = 0;
+  static constexpr int v_prefetch = tile_start + 1;
+  static constexpr int qk_begin = v_prefetch + 1;
+  static constexpr int k_prefetch(int qk_spans) { return qk_begin + qk_spans; }
+  static constexpr int softmax(int qk_spans) { return k_prefetch(qk_spans) + 1; }
+  static constexpr int pv_begin(int qk_spans) {
+    return softmax(qk_spans) + fmha_trace_softmax_phase_count;
+  }
+};
 
 inline uint64_t fmha_trace_clock() {
   namespace timing = sycl::ext::oneapi::experimental;
@@ -315,12 +360,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
 #ifdef CUTLASS_BMG_FMHA_TRACE
     FmhaTraceSpan* trace = nullptr;
     int trace_tiles = 0;
+    unsigned trace_subgroups = 0;
+    uint32_t* trace_placements = nullptr;
 #endif
   };
 
 #ifdef CUTLASS_BMG_FMHA_TRACE
-  static constexpr int trace_spans_per_tile = DTiles + 1 + VTiles;
-  static constexpr int trace_qk_spans = DTiles;
+  static constexpr int trace_qk_spans = DTiles * fmha_trace_qk_phase_count;
+  static constexpr int trace_spans_per_tile =
+      FmhaTraceLayout::pv_begin(trace_qk_spans) + VTiles * fmha_trace_pv_phase_count;
 #endif
 
   // Kernel-facing parameters
@@ -345,6 +393,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
 #ifdef CUTLASS_BMG_FMHA_TRACE
     params.trace = args.trace;
     params.trace_tiles = args.trace_tiles;
+    params.trace_subgroups = args.trace_subgroups;
+    params.trace_placements = args.trace_placements;
 #endif
     return params;
   }
@@ -643,9 +693,19 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       auto sg_trace = get_sub_group();
       auto sg_id = sg_trace.get_group_linear_id();
       bool trace_leader = sg_trace.leader();
+      auto trace_tile_index = sg_id * params.trace_tiles + K;
       auto* tile_trace = params.trace && K < params.trace_tiles &&
-                         sg_id < fmha_trace_subgroups && get_nd_item<3>().get_group_linear_id() == 0
-          ? params.trace + (sg_id * params.trace_tiles + K) * trace_spans_per_tile : nullptr;
+                         sg_id < params.trace_subgroups && get_nd_item<3>().get_group_linear_id() == 0
+          ? params.trace + trace_tile_index * trace_spans_per_tile : nullptr;
+      if (tile_trace) {
+        auto start = fmha_trace_clock();
+        if (trace_leader) {
+          tile_trace[FmhaTraceLayout::tile_start] = {start, start};
+          if (params.trace_placements) {
+            params.trace_placements[trace_tile_index] = fmha_trace_read_sr0();
+          }
+        }
+      }
 #endif
 
       int k_idx;
@@ -659,21 +719,46 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       }
       // V prefetch for next iteration (non-cache only; cache prefetch lives below).
       if constexpr (!is_cache) {
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        FmhaTraceRange v_prefetch_trace(tile_trace ? tile_trace + FmhaTraceLayout::v_prefetch : nullptr,
+                                        trace_leader);
+#endif
         prefetch_with_payloads(prefetch_v, prepared_pv, shape(pVgV(_,_,_,0)));
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        v_prefetch_trace.finish();
+#endif
         update_payloads(prepared_pv, kv_stride);
       }
       /* GEMM 1: S = K * Q */
       CUTLASS_PRAGMA_UNROLL
 
       for (int D = 0; D < DTiles; D++) {
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        auto* qk_trace_spans = tile_trace
+            ? tile_trace + FmhaTraceLayout::qk_begin + D * fmha_trace_qk_phase_count : nullptr;
+        FmhaTraceRange load_trace(qk_trace_spans ? qk_trace_spans + fmha_trace_k_load : nullptr,
+                                  trace_leader);
+#endif
         if constexpr (is_cache) {
           copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
         } else {
           copy_with_multi_payloads(copy_k, prepared_k[D], tKrK);
+        }
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        load_trace.finish();
+#endif
+        if constexpr (!is_cache) {
           update_payloads(prepared_k[D], kv_stride);
         }
 
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        FmhaTraceRange reorder_trace(qk_trace_spans ? qk_trace_spans + fmha_trace_k_reorder : nullptr,
+                                     trace_leader);
+#endif
         reorder(tKrK, tSrK);
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        reorder_trace.finish();
+#endif
 
         if constexpr (BlockScale) {
           if constexpr (sizeof_bits_v<ElementQ> <= 8) {
@@ -722,7 +807,8 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
           }
           auto const& tSrQ_d = tSrQ_arr[D];
 #ifdef CUTLASS_BMG_FMHA_TRACE
-          FmhaTraceRange qk_trace(tile_trace ? tile_trace + D : nullptr, trace_leader);
+          FmhaTraceRange qk_trace(qk_trace_spans ? qk_trace_spans + fmha_trace_qk_dpas : nullptr,
+                                  trace_leader);
 #endif
           if (D == 0) {
             cute::gemm<true>(mma_qk, tSrQ_d(_, _, 0), tSrK(_, _, 0), tSrS);
@@ -746,7 +832,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
           prefetch(prefetch_v_cache, pVgV_cache(_,_,_,VV,k_idx));
         }
       } else {
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        FmhaTraceRange k_prefetch_trace(
+            tile_trace ? tile_trace + FmhaTraceLayout::k_prefetch(trace_qk_spans) : nullptr,
+            trace_leader);
+#endif
         prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_,_,_,0)));
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        k_prefetch_trace.finish();
+#endif
         update_payloads(prepared_pk, kv_stride);
       }
       // Prefetch V scale
@@ -816,11 +910,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
         qk_scale = params.scale * ElementS(scale_q) * ElementS(scale_k);
       }
 #ifdef CUTLASS_BMG_FMHA_TRACE
-      FmhaTraceRange softmax_trace(tile_trace ? tile_trace + DTiles : nullptr, trace_leader);
-#endif
-      auto [rescale, tS_partial_sum] = softmax(tSrS, tA_max, tA_sum, qk_scale);
-#ifdef CUTLASS_BMG_FMHA_TRACE
+      auto* softmax_spans = tile_trace ? tile_trace + FmhaTraceLayout::softmax(trace_qk_spans) : nullptr;
+      FmhaTraceRange softmax_trace(softmax_spans, trace_leader);
+      auto [rescale, tS_partial_sum] =
+          softmax(tSrS, tA_max, tA_sum, qk_scale, softmax_spans, trace_leader);
       softmax_trace.finish();
+#else
+      auto [rescale, tS_partial_sum] = softmax(tSrS, tA_max, tA_sum, qk_scale);
 #endif
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       constexpr int kSumSize = decltype(tA_sum.size())::value;
@@ -828,6 +924,10 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       using ElementP = typename TiledMMAPV::ValTypeA;
+#ifdef CUTLASS_BMG_FMHA_TRACE
+      FmhaTraceRange p_pack_trace(softmax_spans ? softmax_spans + fmha_trace_p_pack : nullptr,
+                                  trace_leader);
+#endif
       if constexpr (std::is_same_v<ElementP, bfloat16_t>) {
         static_assert(decltype(tArP.size())::value % 2 == 0,
                       "tArP per-WI element count must be even for f32x2->bf16x2 packing");
@@ -846,19 +946,41 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       else {
         reorder(tSrS, tArP);
       }
+#ifdef CUTLASS_BMG_FMHA_TRACE
+      p_pack_trace.finish();
+#endif
 
       /* GEMM 2: A += P * V, split in v dimension.
         tArA rescaling is fused to per-VTile */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        auto* pv_spans = tile_trace
+            ? tile_trace + FmhaTraceLayout::pv_begin(trace_qk_spans) + VV * fmha_trace_pv_phase_count
+            : nullptr;
+        FmhaTraceRange v_load_trace(pv_spans ? pv_spans + fmha_trace_v_load : nullptr, trace_leader);
+#endif
         if constexpr (is_cache) {
           copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
         } else {
           copy_with_multi_payloads(copy_v, prepared_v[VV], tVrV);
+        }
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        v_load_trace.finish();
+#endif
+        if constexpr (!is_cache) {
           update_payloads(prepared_v[VV], kv_stride);
         }
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        FmhaTraceRange v_reorder_trace(pv_spans ? pv_spans + fmha_trace_v_reorder : nullptr,
+                                       trace_leader);
+#endif
         reorder(tVrV, tArV);
-
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        v_reorder_trace.finish();
+        FmhaTraceRange correction_trace(pv_spans ? pv_spans + fmha_trace_output_correction : nullptr,
+                                        trace_leader);
+#endif
         CUTLASS_PRAGMA_UNROLL
         for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
           tArA(_,_,_,VV)(i) *= broadcast<0>(rescale, tArA, i);
@@ -870,6 +992,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
             tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
           }
         }
+#ifdef CUTLASS_BMG_FMHA_TRACE
+        correction_trace.finish();
+#endif
         if constexpr (BlockScale && !FP4Input) {
           const int v_coord = get<1>(blk_qv) * VTiles * BLK_V + VV * BLK_V + (subgroup_id % ATOM_V) * SG_V;
           auto& tiled_copy_scaleP = get<0>(get<0>(scale_context_pv));
@@ -902,7 +1027,7 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
             dequantize(tArV, scale_v);
           }
 #ifdef CUTLASS_BMG_FMHA_TRACE
-          FmhaTraceRange pv_trace(tile_trace ? tile_trace + DTiles + 1 + VV : nullptr, trace_leader);
+          FmhaTraceRange pv_trace(pv_spans ? pv_spans + fmha_trace_pv_dpas : nullptr, trace_leader);
 #endif
           cute::gemm(mma_pv, tArP, tArV, tArA(_,_,_,VV));
 #ifdef CUTLASS_BMG_FMHA_TRACE
@@ -963,10 +1088,23 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
   softmax(FragS          & tS,        // Softmax src/dst block
           FragARow       & tA_max,    // Softmax row-wise max accumulator
           FragSPartialRow& tA_sum,    // Softmax row-wise partial sum (per-lane)
-          ElementS         qk_scale) {//  Q*K scale fold with original scale
+          ElementS         qk_scale   // Q*K scale fold with original scale
+#ifdef CUTLASS_BMG_FMHA_TRACE
+          , FmhaTraceSpan* trace_spans, bool trace_leader
+#endif
+          ) {
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    FmhaTraceRange row_max_trace(trace_spans ? trace_spans + fmha_trace_row_max : nullptr,
+                                  trace_leader);
+#endif
     /* Compute row-wise maxima for this block */
     auto tS_bmax = reduce<1, ReduceMode::Full, /*EnableFast64Rows=*/!CausalMask>(tS, sycl::maximum<void>{});
 
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    row_max_trace.finish();
+    FmhaTraceRange factor_trace(trace_spans ? trace_spans + fmha_trace_rescale_factor : nullptr,
+                                 trace_leader);
+#endif
     FragARow rescale;
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tA_max.size(); i++) {
@@ -975,6 +1113,10 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       tA_max(i) = new_max;
     }
 
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    factor_trace.finish();
+    FmhaTraceRange exp_sum_trace(trace_spans ? trace_spans + fmha_trace_exp_sum : nullptr, trace_leader);
+#endif
     /* Scale S and subtract maxima, then exponentiate */
     CUTLASS_PRAGMA_UNROLL
     for (int i = 0; i < tS.size(); i++)
@@ -986,6 +1128,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
 
     /* Per-lane vertical partial sum (deferred horizontal reduction) */
     auto tS_partial_sum = reduce<1, ReduceMode::Vertical>(tS, sycl::plus<void>{});
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    exp_sum_trace.finish();
+#endif
 
     constexpr int kSumSize = decltype(tA_sum.size())::value;
     constexpr bool kSumDivVT = (kSumSize % VTiles == 0);

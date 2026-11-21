@@ -72,6 +72,7 @@ struct Options {
 #ifdef CUTLASS_BMG_FMHA_TRACE
   std::string trace_file;
   int trace_tiles = 8;
+  int trace_subgroups = 2;
 #endif
 
   Options()
@@ -139,11 +140,12 @@ struct Options {
 #ifdef CUTLASS_BMG_FMHA_TRACE
     cmd.get_cmd_line_argument("trace", trace_file, std::string{});
     cmd.get_cmd_line_argument("trace_tiles", trace_tiles, 8);
+    cmd.get_cmd_line_argument("trace_subgroups", trace_subgroups, 2);
     if (!trace_file.empty() &&
-        (trace_tiles < 1 || trace_tiles > 32 || varlen || is_causal || use_paged_kv ||
+        (trace_tiles < 1 || trace_tiles > 32 || trace_subgroups < 1 || varlen || is_causal || use_paged_kv ||
          seq_len_kv_cache != 0 || scheduler != "Individual")) {
       std::cerr << "--trace requires fixed-length non-causal prefill, the Individual "
-                   "scheduler, no KV cache, and --trace_tiles in [1, 32].\n";
+                   "scheduler, no KV cache, --trace_tiles in [1, 32], and at least one subgroup.\n";
       error = true;
     }
 #endif
@@ -175,7 +177,8 @@ struct Options {
         << "                              <=0 means a single full chunk.\n\n";
 #ifdef CUTLASS_BMG_FMHA_TRACE
     out << "  --trace=<path>              Write Chrome/Perfetto JSON from one extra dispatch.\n"
-        << "  --trace_tiles=<int>         Number of initial KV tiles to trace (default: 8).\n";
+        << "  --trace_tiles=<int>         Number of initial KV tiles to trace (default: 8).\n"
+        << "  --trace_subgroups=<int>     Number of subgroups to trace in workgroup 0 (default: 2).\n";
 #endif
     return out;
   }
@@ -995,6 +998,13 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
   }
 
   cutlass::Status run(const Options &options, const cutlass::KernelHardwareInfo &hw_info) {
+#ifdef CUTLASS_BMG_FMHA_TRACE
+    using SGPerWG = typename CollectiveMainloop::SGPerWG;
+    if (!options.trace_file.empty() && options.trace_subgroups > SGPerWG::value) {
+      std::cerr << "--trace_subgroups cannot exceed " << SGPerWG::value << " for this kernel.\n";
+      return cutlass::Status::kErrorInvalidProblem;
+    }
+#endif
 
     ProblemShapeType shape = initialize(options);
 
@@ -1153,7 +1163,8 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
 #ifdef CUTLASS_BMG_FMHA_TRACE
     if (!options.trace_file.empty()) {
       auto queue = compat::get_default_queue();
-      if (!queue.get_device().has(sycl::aspect::ext_oneapi_clock_sub_group)) {
+      auto device = queue.get_device();
+      if (!device.has(sycl::aspect::ext_oneapi_clock_sub_group)) {
         std::cerr << "FMHA tracing requires a device with a subgroup clock.\n";
         return cutlass::Status::kErrorNotSupported;
       }
@@ -1161,12 +1172,19 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       constexpr int qk_spans = CollectiveMainloop::trace_qk_spans;
       int tiles = std::min(options.trace_tiles, int(cute::ceil_div(
           options.seq_len_kv, get<1>(typename CollectiveMainloop::TileShapeQK{}))));
-      size_t count = cutlass::fmha::fmha_trace_subgroups * tiles * spans_per_tile;
+      size_t count = size_t(options.trace_subgroups) * tiles * spans_per_tile;
       using Span = cutlass::fmha::FmhaTraceSpan;
       cutlass::device_memory::allocation<Span> trace(count);
       queue.memset(trace.get(), 0, count * sizeof(Span)).wait_and_throw();
+      cutlass::device_memory::allocation<uint32_t> placements;
+      if (fmha_trace::supports_placement(device)) {
+        placements.reset(size_t(options.trace_subgroups) * tiles);
+        queue.memset(placements.get(), 0xff, placements.size() * sizeof(uint32_t)).wait_and_throw();
+      }
       arguments.mainloop.trace = trace.get();
       arguments.mainloop.trace_tiles = tiles;
+      arguments.mainloop.trace_subgroups = options.trace_subgroups;
+      arguments.mainloop.trace_placements = placements.get();
       run(FMHAKernel::to_underlying_arguments(arguments, workspace.get()));
       queue.wait_and_throw();
       if (options.verify != 0) {
@@ -1178,7 +1196,13 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
       }
       std::vector<Span> spans(count);
       queue.memcpy(spans.data(), trace.get(), count * sizeof(Span)).wait_and_throw();
-      if (!fmha_trace::write(options.trace_file, spans, tiles, spans_per_tile, qk_spans,
+      std::vector<uint32_t> placement_samples(placements.size());
+      if (!placement_samples.empty()) {
+        queue.memcpy(placement_samples.data(), placements.get(),
+                     placement_samples.size() * sizeof(uint32_t)).wait_and_throw();
+      }
+      if (!fmha_trace::write(options.trace_file, spans, placement_samples, device,
+                            options.trace_subgroups, tiles, spans_per_tile, qk_spans,
                             fmha_trace::microseconds_per_tick(queue))) {
         return cutlass::Status::kErrorInternal;
       }

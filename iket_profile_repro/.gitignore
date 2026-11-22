@@ -1,0 +1,8 @@
+.venv/
+.uv/
+.uv-cache/
+tmp/
+iket_output/
+build/
+__pycache__/
+*.pyc

@@ -1,0 +1,4 @@
+full 1 ranges 2832 e2e_median_us 3.520 e2e_mean_us 2.864 warp_median_us 3.936
+full 2 ranges 2832 e2e_median_us 3.488 e2e_mean_us 2.911 warp_median_us 3.904
+min 1 ranges 112 e2e_median_us 2.768 e2e_mean_us 2.345 warp_median_us 3.200
+min 2 ranges 112 e2e_median_us 2.752 e2e_mean_us 2.404 warp_median_us 3.232

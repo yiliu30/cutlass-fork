@@ -181,7 +181,12 @@ int main(int argc, const char **argv) {
 #ifdef DECODE
   constexpr int PipelineStages = 1;
 #else
+#if HEAD_DIM == 128
+  // Five stages hide K/V load latency for the 128x64 prefill tile.
+  constexpr int PipelineStages = 5;
+#else
   constexpr int PipelineStages = 2;
+#endif
 #endif
 
 #if PERSISTENT

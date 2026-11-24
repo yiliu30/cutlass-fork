@@ -43,6 +43,10 @@
 #include "cute/util/sycl_vec.hpp"
 #include "fmha_fusion.hpp"
 
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+#include "ikp_xe/trace.hpp"
+#endif
+
 namespace cutlass::fmha {
 
 template <int Stages> class XeDefault {};   // Default FMHA mainloop, P in registers.
@@ -271,11 +275,38 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
   using ElementScaleP = cute::conditional_t<BlockScale, ElementScaleV, DefScaleType>;
 
   // User-facing arguments
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+  enum FmhaIkpRegion : uint16_t {
+    kIkpTile = 0,
+    kIkpVprefetch,
+    kIkpKload,
+    kIkpKreorder,
+    kIkpQk,
+    kIkpKprefetch,
+    kIkpSoftmax,
+    kIkpPpack,
+    kIkpVload,
+    kIkpVreorder,
+    kIkpRescale,
+    kIkpPv,
+    kIkpRegionCount
+  };
+  static constexpr uint32_t ikp_cap = 4096;
+  static constexpr std::array<char const*, 12> ikp_region_names{{
+      "tile", "v_prefetch", "k_load", "k_reorder", "qk", "k_prefetch",
+      "softmax", "p_pack", "v_load", "v_reorder", "out_rescale", "pv"}};
+#endif
+
   struct Arguments {
     ElementS const scale;
     int const* ptr_page_table = nullptr;
     int page_size = 0;
     int const* num_pages_per_seq = nullptr;
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    ikp_xe::GlobalBuffer ikp{};
+    int ikp_trace_tiles = 0;
+    unsigned ikp_trace_subgroups = 0;
+#endif
   };
 
   // Kernel-facing parameters
@@ -296,7 +327,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
   Params to_underlying_arguments(Arguments const &args, void * /* workspace */) {
     constexpr double kLog2e = 1.4426950408889634074;            // log_2(e)
     ElementS val = args.scale * static_cast<ElementS>(kLog2e);
-    return Params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
+    Params params{val, args.ptr_page_table, args.page_size, args.num_pages_per_seq};
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    params.ikp = args.ikp;
+    params.ikp_trace_tiles = args.ikp_trace_tiles;
+    params.ikp_trace_subgroups = args.ikp_trace_subgroups;
+#endif
+    return params;
   }
 
   CUTLASS_HOST_DEVICE static
@@ -578,6 +615,14 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
     }
     constexpr int kAtomsPerD = decltype(get<2>(TileShapeQK{}))::value
                              / decltype(get<2>(typename TiledMMAQK::AtomShape_MNK{}))::value;
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    auto ikp_sg = sycl::ext::oneapi::this_work_item::get_sub_group();
+    ikp_xe::SubgroupContext<ikp_cap> ikp_ctx;
+    if (ikp_sg.leader()) {
+      ikp_ctx.init(params.ikp, get_nd_item<3>().get_group_linear_id(),
+                   ikp_sg.get_group_linear_id());
+    }
+#endif
     /* Main loop body */
     auto mainloop_body = [&](auto cached_k, int K,
                              auto& copy_k_cur, auto& copy_v_cur,
@@ -588,6 +633,13 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       barrier_arrive(ScopeWorkgroup);
 #endif
       constexpr bool is_cache = decltype(cached_k)::value;
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      const bool ikp_trace =
+          params.ikp.events && K < params.ikp_trace_tiles &&
+          ikp_sg.get_group_linear_id() < params.ikp_trace_subgroups &&
+          get_nd_item<3>().get_group_linear_id() == 0;
+      IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpTile, ikp_trace);
+#endif
 
       int k_idx;
       if constexpr (is_cache) {
@@ -600,21 +652,38 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       }
       // V prefetch for next iteration (non-cache only; cache prefetch lives below).
       if constexpr (!is_cache) {
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpVprefetch, ikp_trace);
+#endif
         prefetch_with_payloads(prefetch_v, prepared_pv, shape(pVgV(_,_,_,0)));
         update_payloads(prepared_pv, kv_stride);
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpVprefetch, ikp_trace);
+#endif
       }
       /* GEMM 1: S = K * Q */
       CUTLASS_PRAGMA_UNROLL
 
       for (int D = 0; D < DTiles; D++) {
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpKload, ikp_trace);
+#endif
         if constexpr (is_cache) {
           copy(copy_k_cur, tKgK_cur(_,_,_,k_idx,D), tKrK);
         } else {
           copy_with_multi_payloads(copy_k, prepared_k[D], tKrK);
           update_payloads(prepared_k[D], kv_stride);
         }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpKload, ikp_trace);
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpKreorder, ikp_trace);
+#endif
 
         reorder(tKrK, tSrK);
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpKreorder, ikp_trace);
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpQk, ikp_trace);
+#endif
 
         if constexpr (BlockScale) {
           if constexpr (sizeof_bits_v<ElementQ> <= 8) {
@@ -672,9 +741,15 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
             cute::gemm(mma_qk, tSrQ_d, tSrK, tSrS);
           }
         }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpQk, ikp_trace);
+#endif
       }
 
       /* K prefetch for next iteration */
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpKprefetch, ikp_trace);
+#endif
       if constexpr (is_cache) {
         CUTLASS_PRAGMA_UNROLL
         for (int VV = 0; VV < VTiles; VV++) {
@@ -684,6 +759,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
         prefetch_with_payloads(prefetch_k, prepared_pk, shape(pKgK(_,_,_,0)));
         update_payloads(prepared_pk, kv_stride);
       }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpKprefetch, ikp_trace);
+#endif
       // Prefetch V scale
       if constexpr (BlockScale) {
         auto& tiled_prefetch_scaleV = get<0>(get<2>(scale_context_pv));
@@ -750,13 +828,22 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       if constexpr (PerTensorScale) {
         qk_scale = params.scale * ElementS(scale_q) * ElementS(scale_k);
       }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpSoftmax, ikp_trace);
+#endif
       auto [rescale, tS_partial_sum] = softmax(tSrS, tA_max, tA_sum, qk_scale);
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpSoftmax, ikp_trace);
+#endif
       auto sg = sycl::ext::oneapi::this_work_item::get_sub_group();
       constexpr int kSumSize = decltype(tA_sum.size())::value;
       constexpr bool kSumDivVT = (kSumSize % VTiles == 0);
       constexpr int kSumPerVT = kSumDivVT ? (kSumSize / VTiles) : 0;
       /* Apply softmax and scaling (tA rescaling fused into GEMM2 VTile loop) */
       using ElementP = typename TiledMMAPV::ValTypeA;
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpPpack, ikp_trace);
+#endif
       if constexpr (std::is_same_v<ElementP, bfloat16_t>) {
         static_assert(decltype(tArP.size())::value % 2 == 0,
                       "tArP per-WI element count must be even for f32x2->bf16x2 packing");
@@ -775,18 +862,32 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
       else {
         reorder(tSrS, tArP);
       }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpPpack, ikp_trace);
+#endif
 
       /* GEMM 2: A += P * V, split in v dimension.
         tArA rescaling is fused to per-VTile */
       CUTLASS_PRAGMA_UNROLL
       for (int VV = 0; VV < VTiles; VV++) {
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpVload, ikp_trace);
+#endif
         if constexpr (is_cache) {
           copy(copy_v_cur, tVgV_cur(_,_,_,VV,k_idx), tVrV);
         } else {
           copy_with_multi_payloads(copy_v, prepared_v[VV], tVrV);
           update_payloads(prepared_v[VV], kv_stride);
         }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpVload, ikp_trace);
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpVreorder, ikp_trace);
+#endif
         reorder(tVrV, tArV);
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpVreorder, ikp_trace);
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpRescale, ikp_trace);
+#endif
 
         CUTLASS_PRAGMA_UNROLL
         for (int i = tArA.size() / VTiles - 1; i >= 0; i--)
@@ -799,6 +900,10 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
             tA_sum(i) = tA_sum(i) * group_broadcast(sg, rescale(0), i) + tS_partial_sum(i);
           }
         }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpRescale, ikp_trace);
+        IKP_XE_BEGIN_IF(ikp_ctx, params.ikp, ikp_sg, kIkpPv, ikp_trace);
+#endif
         if constexpr (BlockScale && !FP4Input) {
           const int v_coord = get<1>(blk_qv) * VTiles * BLK_V + VV * BLK_V + (subgroup_id % ATOM_V) * SG_V;
           auto& tiled_copy_scaleP = get<0>(get<0>(scale_context_pv));
@@ -832,6 +937,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
           }
           cute::gemm(mma_pv, tArP, tArV, tArA(_,_,_,VV));
         }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+        IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpPv, ikp_trace);
+#endif
       }
 
       /* K prefetch */
@@ -860,6 +968,9 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
 #if not defined(CUTLASS_TEST_FOR_CRI)
       barrier_wait(ScopeWorkgroup);
 #endif
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+      IKP_XE_END_IF(ikp_ctx, params.ikp, ikp_sg, kIkpTile, ikp_trace);
+#endif
     };
 
     /* Main loop, blocked in k. */
@@ -878,6 +989,11 @@ struct FMHAFwdMainloop<XeDefault<Stages>, CausalMask_, BlockScale_, F8kvF16mma_,
                     prefetch_v, tKgK,
                     tVgV, pVgV);
     }
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    if (ikp_sg.leader()) {
+      ikp_ctx.flush(params.ikp);
+    }
+#endif
   }
 
   // Single step of blocked softmax.

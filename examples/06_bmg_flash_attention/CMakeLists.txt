@@ -29,6 +29,7 @@
 
 
 set(CUTLASS_APPLICATIONS_DIR ${CUTLASS_DIR}/applications)
+option(CUTLASS_ENABLE_BMG_FMHA_IKP_XE "Enable IKP-XE region profiling in the BF16 hdim128 prefill example" OFF)
 # TODO For Multitarget, these input types may be wrong for non-cri hardware.
 # Skip non-supported tests at runtime, keep this flag as well to not increase compile
 # time for single target build.
@@ -126,6 +127,9 @@ foreach(HEAD_DIM 64 96 128 192)
     endif()
 
     target_compile_definitions(06_xe_fmha_fwd_prefill_${INPUT_TYPE}_hdim${HEAD_DIM} PRIVATE HEAD_DIM=${HEAD_DIM} PREFILL SHOW_DIFF=1 INPUT_TYPE=${INPUT_TYPE} ${INPUT_MACRO})
+    if(CUTLASS_ENABLE_BMG_FMHA_IKP_XE AND INPUT_TYPE STREQUAL "bfloat16_t" AND HEAD_DIM EQUAL 128)
+      target_compile_definitions(06_xe_fmha_fwd_prefill_${INPUT_TYPE}_hdim${HEAD_DIM} PRIVATE CUTLASS_BMG_FMHA_IKP_XE)
+    endif()
     target_compile_definitions(06_xe_fmha_fwd_decode_${INPUT_TYPE}_hdim${HEAD_DIM} PRIVATE HEAD_DIM=${HEAD_DIM} DECODE SHOW_DIFF=1 INPUT_TYPE=${INPUT_TYPE} ${INPUT_MACRO})
 
     # --- Cached KV targets (CachedKV=true, PagedKV=false, split into separate binary) ---

@@ -51,6 +51,10 @@
 
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+#include "ikp_xe/trace.hpp"
+#endif
+
 using namespace cute;
 
 // Command line options parsing
@@ -65,6 +69,11 @@ struct Options {
 
   int batch, num_heads_q, num_heads_kv, seq_len_qo, seq_len_kv, seq_len_kv_cache, page_size, head_size_qk, head_size_vo, iterations, warmup, verify, seq_chunk_len;
   float softmax_scale;
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+  std::string trace_file;
+  int trace_tiles = 32;
+  int trace_subgroups = 16;
+#endif
 
   Options()
       : help(false), error(false), is_causal(false), varlen(false), use_paged_kv(false), batch(32), num_heads_q(16), num_heads_kv(16), seq_len_qo(512), head_size_qk(128),
@@ -128,6 +137,18 @@ struct Options {
     }
 
     softmax_scale = 1 / sqrt(static_cast<float>(head_size_qk));
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    cmd.get_cmd_line_argument("trace", trace_file, std::string{});
+    cmd.get_cmd_line_argument("trace_tiles", trace_tiles, 32);
+    cmd.get_cmd_line_argument("trace_subgroups", trace_subgroups, 16);
+    if (!trace_file.empty() &&
+        (trace_tiles < 1 || trace_tiles > 32 || trace_subgroups < 1 || varlen || is_causal ||
+         use_paged_kv || seq_len_kv_cache != 0 || scheduler != "Individual")) {
+      std::cerr << "--trace requires fixed-length non-causal prefill, the Individual "
+                   "scheduler, no KV cache, --trace_tiles in [1, 32], and at least one subgroup.\n";
+      error = true;
+    }
+#endif
   }
 
   /// Prints the usage statement.
@@ -154,6 +175,11 @@ struct Options {
         << "  --verify=<int>              Specify whether to verify.\n"
         << "  --seq_chunk_len=<int>       KV chunk length for sequence-parallel (LSE) runs.\n"
         << "                              <=0 means a single full chunk.\n\n";
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    out << "  --trace=<path>              Write an IKP-XE .ikptrace file from one extra dispatch.\n"
+        << "  --trace_tiles=<int>         Number of initial KV tiles to trace (default: 32).\n"
+        << "  --trace_subgroups=<int>     Number of subgroups to trace in workgroup 0 (default: 16).\n";
+#endif
     return out;
   }
 };
@@ -1126,6 +1152,41 @@ template <class FMHAKernel, bool isVarLen = false> struct ExampleRunner {
                 << "\t Scheduler: " << options.scheduler;
       printf("\nPerformance:   %4.3f  GB/s,    %4.3f  TFlop/s,   %6.4f  ms\n\n", gbps, tflops, cute_time * 1000);
     }
+
+#ifdef CUTLASS_BMG_FMHA_IKP_XE
+    if (!options.trace_file.empty()) {
+      auto queue = compat::get_default_queue();
+      auto device = queue.get_device();
+      if (!device.has(sycl::aspect::ext_oneapi_clock_sub_group)) {
+        std::cerr << "IKP-XE tracing requires a device with a subgroup clock.\n";
+        return cutlass::Status::kErrorNotSupported;
+      }
+      constexpr int sg_per_wg = CollectiveMainloop::SGPerWG::value;
+      int tiles = std::min(options.trace_tiles, int(cute::ceil_div(
+          options.seq_len_kv, get<1>(typename CollectiveMainloop::TileShapeQK{}))));
+      if (options.trace_subgroups > sg_per_wg) {
+        std::cerr << "--trace_subgroups cannot exceed " << sg_per_wg << " for this kernel.\n";
+        return cutlass::Status::kErrorInvalidProblem;
+      }
+      ikp_xe::HostSession session(queue);
+      session.init(CollectiveMainloop::ikp_cap, 1, sg_per_wg, 0, 1);
+      std::vector<std::string> region_names;
+      for (auto name : CollectiveMainloop::ikp_region_names) region_names.emplace_back(name);
+      session.set_region_names(std::move(region_names));
+      session.reset();
+      session.calibrate();
+
+      auto ikp_params = params;
+      ikp_params.mainloop.ikp = session.global_buffer();
+      ikp_params.mainloop.ikp_trace_tiles = tiles;
+      ikp_params.mainloop.ikp_trace_subgroups = options.trace_subgroups;
+      run(ikp_params);
+      queue.wait_and_throw();
+      if (!session.write_raw(options.trace_file)) {
+        return cutlass::Status::kErrorInternal;
+      }
+    }
+#endif
 
     return cutlass::Status::kSuccess;
   }
